@@ -14,6 +14,7 @@ The fix is a local, durable resume queue owned by Taskboard. The local database 
 
 - The issue must continue in its original Codex thread; creating a replacement thread is not allowed.
 - The feature is local-only. Cloud collaboration and multi-device routing are out of scope.
+- Cloud mode keeps its existing scheduled handoff behavior; the shared automation builder must not apply local-only prompt or host-worker semantics to Cloud policies.
 - If the original thread is active, Taskboard waits without interrupting it.
 - A queued request survives Taskboard or Codex restarts.
 - A missing or irrecoverable thread produces a visible failed handoff; the issue remains `todo`.
@@ -51,7 +52,7 @@ The same prompt also calls `automation_update` from the scheduled run. This mixe
 4. Make delivery idempotent across retries and process restarts.
 5. Expose pending, dispatched, acknowledged, canceled, and failed states in Taskboard.
 6. Keep standalone automation responsible only for unbound new work.
-7. Remove scheduled-run calls to `send_message_to_thread` and `automation_update`.
+7. Remove scheduled-run calls to `send_message_to_thread` and `automation_update` from local-mode automation.
 8. Archive empty, unbound automation scan windows without archiving task-owned threads.
 
 ## Non-goals
@@ -135,15 +136,15 @@ Changing fields on an issue already in `todo` does not create another request. A
 
 ### Upgrade backfill
 
-After creating the table, the local migration queries existing unarchived tasks with `status = 'todo'` and a non-null `thread_id`. It inserts one pending request per task when no open request exists. Delivery still requires the project’s user-enabled automatic-claim policy, so upgrading does not send anything for projects where automation is disabled.
+Only when the table is first created, the local migration queries existing unarchived tasks with `status = 'todo'` and a non-null `thread_id`. It inserts one pending request per task when no open request exists. Later startups do not repeat the backfill, so a visible `failed` request cannot silently become pending again after restart. Delivery still requires the project’s user-enabled automatic-claim policy, so upgrading does not send anything for projects where automation is disabled.
 
 ### Acknowledgement rule
 
-After a task successfully transitions from `todo` to `in_progress`, the same database transaction marks its latest `dispatched` request as `acknowledged` only when the write’s thread ID equals the request’s copied `thread_id`.
+After a task successfully transitions from `todo` to `in_progress`, the same database transaction marks its latest open request (`pending`, `dispatching`, or `dispatched`) as `acknowledged` only when the write actor is the Codex Agent and the write’s thread ID equals the request’s copied `thread_id`. Accepting any open state closes the small race where the resumed turn claims the task before the host records its returned turn ID.
 
-This rule is shared by `updateTask()` and `moveTask()`. A different thread cannot acknowledge another thread’s resume request.
+This rule is shared by `updateTask()` and `moveTask()`. A user drag or a different thread cannot acknowledge another thread’s resume request.
 
-Any mutation that moves the task out of `todo`, archives it, or replaces its thread binding cancels an open request in the same transaction, except for the matching `todo` to `in_progress` acknowledgement above. This prevents an unconsumed request from surviving after its task is no longer eligible.
+Any mutation that moves the task out of `todo`, archives it, changes its project, or replaces its thread binding cancels an open request in the same transaction, except for the matching `todo` to `in_progress` acknowledgement above. This prevents an unconsumed request from surviving after its task is no longer eligible or from crossing project policy boundaries.
 
 ## Local Internal API
 
@@ -304,7 +305,7 @@ The worker never sends a second turn for a request already marked `dispatched`.
 ### Retry policy
 
 - Active thread: unlimited waiting, two-second defer, no attempt increment.
-- Transient App Server or transport error: at most three delivery attempts with delays of 1, 5, and 30 seconds.
+- Transient App Server or transport error: one initial attempt plus at most three retries, delayed by 1, 5, and 30 seconds; the fourth transient failure becomes permanent.
 - Missing thread, irrecoverable resume failure, or invalid direct-input capability: permanent failure.
 - Lost `turn/start` response: retry with the same `clientUserMessageId`; Codex idempotency prevents duplicate turns.
 
@@ -312,7 +313,7 @@ The worker never sends a second turn for a request already marked `dispatched`.
 
 ### Prompt
 
-Update `shared/taskboard-automation.mjs`:
+Update `shared/taskboard-automation.mjs` for local mode:
 
 - remove every instruction to call `send_message_to_thread`;
 - remove every instruction to call `automation_update`;
@@ -320,6 +321,8 @@ Update `shared/taskboard-automation.mjs`:
 - never claim a `todo` that already has `threadId`;
 - state that bound `todo` issues are handled by the local resume worker;
 - end immediately when no unbound eligible issue exists.
+
+Because the builder is shared with Cloud mode, the host resolves `/api/meta` before reconciliation and supplies a transient mode value. Cloud mode continues to build the existing legacy scheduled-handoff prompt and does not start the local resume worker, local claimability reconciliation, or local cleanup pass. The mode value is not stored as user policy.
 
 Update `skills/manage-taskboard/SKILL.md` so the same ownership rule is clear to manually invoked agents.
 
@@ -373,13 +376,14 @@ The retry control calls the local retry endpoint. It never offers “create a ne
 - Lease tokens prevent a stale worker response from changing a request leased by a newer worker pass.
 - A task leaving `todo` supersedes its open request.
 - A changed thread binding supersedes its open request.
+- A changed project supersedes its open request.
 - Multiple comments while one request is pending do not create more requests; the resumed thread reads all current comments.
 - A failed request remains visible until retried or superseded by a later status cycle. A manual retry creates a successor request with a new ID; transport retries within one delivery keep the same ID.
 - The feature does not change the task to `blocked` or `in_progress` on its own.
 
 ## Local-only Boundary
 
-The table, API endpoints, worker, and DTO projection exist only in the local server path. `cloud/src/index.mjs` and `cloud/migrations` are unchanged. When the Taskboard companion is configured for Cloud mode, the local resume worker is disabled and the UI does not claim local resume support.
+The table, API endpoints, worker, and DTO projection exist only in the local server path. `cloud/src/index.mjs` and `cloud/migrations` are unchanged. When the Taskboard companion is configured for Cloud mode, the local resume worker, host-owned claimability reconciliation, and scan cleanup are disabled; the UI does not claim local resume support, and existing Cloud automation keeps its legacy prompt and policy behavior.
 
 ## Direct Acceptance Path
 
