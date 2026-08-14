@@ -1697,14 +1697,17 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const request = this.database.prepare(`
-        SELECT * FROM task_resume_requests
-        WHERE project_id IN (${placeholders})
+        SELECT task_resume_requests.*
+        FROM task_resume_requests
+        JOIN tasks ON tasks.id = task_resume_requests.task_id
+        WHERE task_resume_requests.project_id IN (${placeholders})
+          AND tasks.archived_at IS NULL
           AND (
-            (status = 'pending' AND next_attempt_at <= ?)
-            OR (status = 'dispatching' AND lease_expires_at <= ?)
-            OR (status = 'dispatched' AND next_attempt_at <= ?)
+            (task_resume_requests.status = 'pending' AND task_resume_requests.next_attempt_at <= ?)
+            OR (task_resume_requests.status = 'dispatching' AND task_resume_requests.lease_expires_at <= ?)
+            OR (task_resume_requests.status = 'dispatched' AND task_resume_requests.next_attempt_at <= ?)
           )
-        ORDER BY created_at, rowid
+        ORDER BY task_resume_requests.created_at, task_resume_requests.rowid
         LIMIT 1
       `).get(...projectIds, timestamp, timestamp, timestamp);
       if (!request) {
@@ -2551,7 +2554,7 @@ export class TaskboardDatabase {
   }
 
   #createResumeRequestForTodo(current, nextVersion, threadId, timestamp) {
-    if (current.status === "todo" || !threadId) return;
+    if (current.status === "todo" || current.archivedAt !== null || !threadId) return;
     this.database.prepare(`
       INSERT INTO task_resume_requests (
         id, task_id, project_id, thread_id, task_version, status,
