@@ -1111,6 +1111,13 @@ async function requestTaskboardJson(pathname, { method = "GET", body } = {}) {
   return payload ?? {};
 }
 
+function isClaimableUnboundTodo(task) {
+  return task.status === "todo"
+    && !task.archivedAt
+    && !task.threadId
+    && task.relations.blockedBy.every((dependency) => dependency.status === "done");
+}
+
 function buildTaskResumePrompt(task, request) {
   return `e-taskboard 任务 ${task.identifier} 已被用户退回待办。请读取最新议题和全部评论；仅当任务仍为 todo 且绑定当前会话时，使用最新 version 认领为 in_progress，然后按最新评论继续处理。续跑请求：${request.id}。`;
 }
@@ -1342,6 +1349,10 @@ async function runTaskResumeWorkerPass(cdp) {
       .map((record) => record.request.taskboardProjectId);
     if (projectIds.length === 0) return;
 
+    for (const projectId of projectIds) {
+      await enqueueCurrentQuotaPolicy(projectId);
+    }
+
     nextDelayMs = 2_000;
     claim = await requestTaskboardJson("/api/local/task-resume-requests/claim", {
       method: "POST",
@@ -1376,6 +1387,15 @@ async function applyTaskboardAutomationPolicy(
   stillCurrent = () => true,
   { explicit = false, previousQuotaState } = {},
 ) {
+  const metadata = await requestTaskboardJson("/api/meta");
+  const taskboardMode = metadata.mode === "cloud" ? "cloud" : "local";
+  let hasClaimableTodo;
+  if (taskboardMode === "local") {
+    const listedTasks = await requestTaskboardJson(
+      `/api/tasks?projectId=${encodeURIComponent(request.taskboardProjectId)}&status=todo&archived=false`,
+    );
+    hasClaimableTodo = (listedTasks.tasks ?? []).some(isClaimableUnboundTodo);
+  }
   const quota = request.quotaAware
     ? await readCodexQuotaStatus(request.model)
     : null;
@@ -1396,10 +1416,12 @@ async function applyTaskboardAutomationPolicy(
     previousQuotaState,
     quotaState: quota?.state,
     currentStatus: currentItem?.status,
+    taskboardMode,
+    hasClaimableTodo,
   });
   const result = operation === "list"
     ? { item: currentItem, items: listed.items }
-    : await reconcileTaskboardAutomation({ ...request, operation }, rpc);
+    : await reconcileTaskboardAutomation({ ...request, taskboardMode, operation }, rpc);
   if (result?.error === "not-found") {
     return { operation, ...(quota ? { quota } : {}) };
   }
@@ -1546,10 +1568,6 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         },
       );
       if (result.stale) return result;
-      if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
-        current.version += 1;
-        current.request = { ...current.request, enabledByUser: false };
-      }
       if (result.item?.id) {
         current.request = { ...current.request, automationId: result.item.id };
       }
