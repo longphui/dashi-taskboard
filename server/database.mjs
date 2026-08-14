@@ -31,7 +31,7 @@ function commentConversationTitle(body) {
   return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
 }
 
-function attachTaskActivity(task, comments, activities, previewImage = null) {
+function attachTaskActivity(task, comments, activities, previewImage = null, resumeRequest = null) {
   const orderedComments = [...comments].sort((left, right) => (
     left.id.localeCompare(right.id)
   ));
@@ -93,11 +93,13 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
   task.conversationRefs = conversationRefs;
   task.participants = participants;
   task.previewImage = previewImage;
+  task.resumeRequest = resumeRequest;
   task.activityKey = JSON.stringify({
     version: 1,
     task: [task.id, task.version, task.updatedAt],
     comments: orderedComments.map((comment) => [comment.id, comment.version, comment.updated_at]),
     changes: orderedActivities.map((activity) => [activity.id, activity.created_at]),
+    resumeRequest: [resumeRequest?.id, resumeRequest?.status, resumeRequest?.updatedAt],
   });
   task.activityUpdatedAt = [...orderedComments, ...orderedActivities].reduce(
     (latest, activity) => {
@@ -119,6 +121,25 @@ function taskActivityFromRow(row) {
     actorAvatarUrl: row.actor_avatar_url,
     changes: JSON.parse(row.changes),
     createdAt: row.created_at,
+  };
+}
+
+function taskResumeRequestFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    threadId: row.thread_id,
+    taskVersion: row.task_version,
+    status: row.status,
+    attemptCount: row.attempt_count,
+    nextAttemptAt: row.next_attempt_at,
+    turnId: row.turn_id,
+    retryOfRequestId: row.retry_of_request_id,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -348,6 +369,9 @@ export class TaskboardDatabase {
   }
 
   #migrate() {
+    const resumeRequestsTableExisted = Boolean(this.database.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_resume_requests'
+    `).get());
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -432,6 +456,35 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS task_activities_task_created
         ON task_activities(task_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS task_resume_requests (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        thread_id TEXT NOT NULL,
+        task_version INTEGER NOT NULL CHECK (task_version > 0),
+        status TEXT NOT NULL CHECK (status IN (
+          'pending', 'dispatching', 'dispatched', 'acknowledged', 'failed', 'canceled'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_attempt_at TEXT NOT NULL,
+        lease_token TEXT,
+        lease_expires_at TEXT,
+        turn_id TEXT,
+        retry_of_request_id TEXT REFERENCES task_resume_requests(id),
+        last_error TEXT,
+        dispatched_at TEXT,
+        acknowledged_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS task_resume_requests_one_open
+        ON task_resume_requests(task_id)
+        WHERE status IN ('pending', 'dispatching', 'dispatched');
+
+      CREATE INDEX IF NOT EXISTS task_resume_requests_due
+        ON task_resume_requests(status, next_attempt_at, created_at);
 
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
@@ -729,6 +782,10 @@ export class TaskboardDatabase {
     }
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
 
+    if (!resumeRequestsTableExisted) {
+      this.#backfillTaskResumeRequests();
+    }
+
     const timestamp = now();
     this.database.prepare(`
       INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
@@ -744,6 +801,29 @@ export class TaskboardDatabase {
 
   close() {
     this.database.close();
+  }
+
+  #backfillTaskResumeRequests() {
+    const candidates = this.database.prepare(`
+      SELECT id, project_id, thread_id, version
+      FROM tasks
+      WHERE status = 'todo' AND archived_at IS NULL AND thread_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM task_resume_requests
+          WHERE task_id = tasks.id
+            AND status IN ('pending', 'dispatching', 'dispatched')
+        )
+    `).all();
+    const timestamp = now();
+    const insert = this.database.prepare(`
+      INSERT INTO task_resume_requests (
+        id, task_id, project_id, thread_id, task_version, status,
+        attempt_count, next_attempt_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+    `);
+    for (const task of candidates) {
+      insert.run(randomUUID(), task.id, task.project_id, task.thread_id, task.version, timestamp, timestamp, timestamp);
+    }
   }
 
   #migrateTaskStatuses() {
@@ -1587,11 +1667,13 @@ export class TaskboardDatabase {
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
+    const resumeRequestsByTask = this.#resumeRequestsForTasks(rows.map((row) => row.id));
     return rows.map((row) => attachTaskActivity(
       this.#taskWithRelations(row),
       commentsByTask.get(row.id) ?? [],
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
+      resumeRequestsByTask.get(row.id) ?? null,
     ));
   }
 
@@ -1602,7 +1684,154 @@ export class TaskboardDatabase {
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
     const activities = this.#activitiesForTasks([task.id]).get(task.id) ?? [];
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
-    return attachTaskActivity(task, comments, activities, previewImage);
+    const resumeRequest = this.#resumeRequestsForTasks([task.id]).get(task.id) ?? null;
+    return attachTaskActivity(task, comments, activities, previewImage, resumeRequest);
+  }
+
+  claimTaskResumeRequest(projectIds, leaseSeconds) {
+    if (projectIds.length === 0) return { request: null };
+    const timestamp = now();
+    const leaseToken = randomUUID();
+    const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    const placeholders = projectIds.map(() => "?").join(", ");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const request = this.database.prepare(`
+        SELECT * FROM task_resume_requests
+        WHERE project_id IN (${placeholders})
+          AND (
+            (status = 'pending' AND next_attempt_at <= ?)
+            OR (status = 'dispatching' AND lease_expires_at <= ?)
+            OR (status = 'dispatched' AND next_attempt_at <= ?)
+          )
+        ORDER BY created_at, rowid
+        LIMIT 1
+      `).get(...projectIds, timestamp, timestamp, timestamp);
+      if (!request) {
+        this.database.exec("COMMIT");
+        return { request: null };
+      }
+      const operation = request.status === "dispatched" ? "observe" : "deliver";
+      this.database.prepare(`
+        UPDATE task_resume_requests
+        SET status = CASE WHEN status = 'dispatched' THEN 'dispatched' ELSE 'dispatching' END,
+            lease_token = ?, lease_expires_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(leaseToken, leaseExpiresAt, timestamp, request.id);
+      const claimed = this.database.prepare("SELECT * FROM task_resume_requests WHERE id = ?").get(request.id);
+      this.database.exec("COMMIT");
+      return {
+        operation,
+        request: taskResumeRequestFromRow(claimed),
+        task: this.getTask(claimed.task_id),
+        leaseToken,
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  deferTaskResumeRequest(id, leaseToken, delaySeconds, reason) {
+    const timestamp = now();
+    const nextAttemptAt = new Date(Date.now() + delaySeconds * 1000).toISOString();
+    const result = this.database.prepare(`
+      UPDATE task_resume_requests
+      SET status = CASE WHEN status = 'dispatching' THEN 'pending' ELSE 'dispatched' END,
+          next_attempt_at = ?, lease_token = NULL, lease_expires_at = NULL,
+          last_error = ?, updated_at = ?
+      WHERE id = ? AND lease_token = ? AND lease_expires_at > ?
+        AND status IN ('dispatching', 'dispatched')
+    `).run(nextAttemptAt, reason, timestamp, id, leaseToken, timestamp);
+    return this.#leasedTaskResumeRequest(id, result.changes);
+  }
+
+  markTaskResumeRequestDispatched(id, leaseToken, turnId) {
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE task_resume_requests
+      SET status = 'dispatched', next_attempt_at = ?, lease_token = NULL, lease_expires_at = NULL,
+          turn_id = ?, dispatched_at = ?, updated_at = ?
+      WHERE id = ? AND lease_token = ? AND lease_expires_at > ? AND status = 'dispatching'
+    `).run(timestamp, turnId, timestamp, timestamp, id, leaseToken, timestamp);
+    return this.#leasedTaskResumeRequest(id, result.changes);
+  }
+
+  failTaskResumeRequest(id, leaseToken, error, retryAfterSeconds, permanent) {
+    const timestamp = now();
+    const retryAt = new Date(Date.now() + retryAfterSeconds * 1000).toISOString();
+    const result = this.database.prepare(`
+      UPDATE task_resume_requests
+      SET status = CASE WHEN ? OR attempt_count + 1 >= 4 THEN 'failed' ELSE 'pending' END,
+          attempt_count = attempt_count + 1,
+          next_attempt_at = CASE WHEN ? OR attempt_count + 1 >= 4 THEN ? ELSE ? END,
+          lease_token = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ?
+      WHERE id = ? AND lease_token = ? AND lease_expires_at > ?
+        AND status IN ('dispatching', 'dispatched')
+    `).run(permanent ? 1 : 0, permanent ? 1 : 0, timestamp, retryAt, error, timestamp, id, leaseToken, timestamp);
+    return this.#leasedTaskResumeRequest(id, result.changes);
+  }
+
+  cancelTaskResumeRequest(id, leaseToken, reason) {
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE task_resume_requests
+      SET status = 'canceled', lease_token = NULL, lease_expires_at = NULL,
+          last_error = ?, updated_at = ?
+      WHERE id = ? AND lease_token = ? AND lease_expires_at > ?
+        AND status IN ('dispatching', 'dispatched')
+    `).run(reason, timestamp, id, leaseToken, timestamp);
+    return this.#leasedTaskResumeRequest(id, result.changes);
+  }
+
+  retryTaskResumeRequest(taskId, requestId) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const request = this.database.prepare(`
+        SELECT * FROM task_resume_requests WHERE id = ? AND task_id = ?
+      `).get(requestId, task.id);
+      if (!request) {
+        throw new ApiError(404, "RESUME_REQUEST_NOT_FOUND", `Resume request '${requestId}' does not exist`);
+      }
+      if (
+        request.status !== "failed"
+        || task.archivedAt !== null
+        || task.status !== "todo"
+        || task.threadId !== request.thread_id
+      ) {
+        throw new ApiError(409, "RESUME_REQUEST_NOT_RETRYABLE", "Resume request cannot be retried");
+      }
+      const timestamp = now();
+      const id = randomUUID();
+      this.database.prepare(`
+        INSERT INTO task_resume_requests (
+          id, task_id, project_id, thread_id, task_version, status,
+          attempt_count, next_attempt_at, retry_of_request_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+      `).run(
+        id, task.id, task.projectId, task.threadId, task.version,
+        timestamp, request.id, timestamp, timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        task: this.getTask(task.id),
+        resumeRequest: taskResumeRequestFromRow(this.database.prepare(
+          "SELECT * FROM task_resume_requests WHERE id = ?",
+        ).get(id)),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listOpenTaskResumeThreadIds() {
+    return this.database.prepare(`
+      SELECT DISTINCT thread_id FROM task_resume_requests
+      WHERE status IN ('pending', 'dispatching', 'dispatched')
+      ORDER BY thread_id
+    `).all().map((row) => row.thread_id);
   }
 
   createTask(input) {
@@ -1810,6 +2039,19 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      const nextProjectId = projectChanged ? targetProject.id : current.projectId;
+      const nextStatus = Object.hasOwn(changes, "status") ? changes.status : current.status;
+      const nextThreadId = threadId !== undefined && !Object.hasOwn(changes, "projectId")
+        ? threadId
+        : current.threadId;
+      this.#settleResumeRequestsForTask(
+        current,
+        nextProjectId,
+        nextStatus,
+        nextThreadId,
+        actor,
+        timestamp,
+      );
       if (projectChanged) {
         this.database.prepare(`
           UPDATE projects SET updated_at = ? WHERE id IN (?, ?)
@@ -1869,6 +2111,14 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.#settleResumeRequestsForTask(
+        current,
+        current.projectId,
+        status,
+        threadId ?? current.threadId,
+        actor,
+        timestamp,
+      );
       this.#recordTaskActivity(
         current.id,
         actor,
@@ -1897,6 +2147,12 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.database.prepare(`
+        UPDATE task_resume_requests
+        SET status = 'canceled', lease_token = NULL, lease_expires_at = NULL,
+            updated_at = ?
+        WHERE task_id = ? AND status IN ('pending', 'dispatching', 'dispatched')
+      `).run(timestamp, current.id);
       this.#recordTaskActivity(
         current.id,
         actor,
@@ -2257,6 +2513,23 @@ export class TaskboardDatabase {
     return activitiesByTask;
   }
 
+  #resumeRequestsForTasks(taskIds) {
+    const requestsByTask = new Map();
+    if (taskIds.length === 0) return requestsByTask;
+    const placeholders = taskIds.map(() => "?").join(", ");
+    const rows = this.database.prepare(`
+      SELECT * FROM task_resume_requests
+      WHERE task_id IN (${placeholders})
+      ORDER BY task_id, created_at DESC, rowid DESC
+    `).all(...taskIds);
+    for (const row of rows) {
+      if (!requestsByTask.has(row.task_id)) {
+        requestsByTask.set(row.task_id, taskResumeRequestFromRow(row));
+      }
+    }
+    return requestsByTask;
+  }
+
   #taskPreviewImages(taskIds) {
     const imagesByTask = new Map();
     for (let offset = 0; offset < taskIds.length; offset += 400) {
@@ -2275,6 +2548,101 @@ export class TaskboardDatabase {
       }
     }
     return imagesByTask;
+  }
+
+  #createResumeRequestForTodo(current, nextVersion, threadId, timestamp) {
+    if (current.status === "todo" || !threadId) return;
+    this.database.prepare(`
+      INSERT INTO task_resume_requests (
+        id, task_id, project_id, thread_id, task_version, status,
+        attempt_count, next_attempt_at, created_at, updated_at
+      )
+      SELECT ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM task_resume_requests
+        WHERE task_id = ? AND status IN ('pending', 'dispatching', 'dispatched')
+      )
+    `).run(
+      randomUUID(), current.id, current.projectId, threadId, nextVersion,
+      timestamp, timestamp, timestamp, current.id,
+    );
+  }
+
+  #settleResumeRequestsForTask(current, nextProjectId, nextStatus, nextThreadId, actor, timestamp) {
+    const bindingChanged = (
+      nextProjectId !== current.projectId
+      || nextThreadId !== current.threadId
+    );
+    if (current.status !== "todo" && nextStatus === "todo") {
+      if (bindingChanged) {
+        this.database.prepare(`
+          UPDATE task_resume_requests
+          SET status = 'canceled', lease_token = NULL, lease_expires_at = NULL,
+              updated_at = ?
+          WHERE task_id = ? AND status IN ('pending', 'dispatching', 'dispatched')
+        `).run(timestamp, current.id);
+      }
+      this.#createResumeRequestForTodo(
+        { ...current, projectId: nextProjectId },
+        current.version + 1,
+        nextThreadId,
+        timestamp,
+      );
+      return;
+    }
+    if (current.status !== "todo") {
+      if (bindingChanged) {
+        this.database.prepare(`
+          UPDATE task_resume_requests
+          SET status = 'canceled', lease_token = NULL, lease_expires_at = NULL,
+              updated_at = ?
+          WHERE task_id = ? AND status IN ('pending', 'dispatching', 'dispatched')
+        `).run(timestamp, current.id);
+      }
+      return;
+    }
+
+    if (
+      nextStatus === "in_progress"
+      && actor.type === "agent"
+      && actor.id === "codex-agent"
+      && nextProjectId === current.projectId
+      && nextThreadId
+    ) {
+      const acknowledged = this.database.prepare(`
+        UPDATE task_resume_requests
+        SET status = 'acknowledged', lease_token = NULL, lease_expires_at = NULL,
+            acknowledged_at = ?, updated_at = ?
+        WHERE task_id = ? AND thread_id = ?
+          AND status IN ('pending', 'dispatching', 'dispatched')
+      `).run(timestamp, timestamp, current.id, nextThreadId);
+      if (acknowledged.changes > 0) return;
+    }
+
+    if (
+      nextStatus !== "todo"
+      || bindingChanged
+    ) {
+      this.database.prepare(`
+        UPDATE task_resume_requests
+        SET status = 'canceled', lease_token = NULL, lease_expires_at = NULL,
+            updated_at = ?
+        WHERE task_id = ? AND status IN ('pending', 'dispatching', 'dispatched')
+      `).run(timestamp, current.id);
+    }
+  }
+
+  #leasedTaskResumeRequest(id, changes) {
+    if (changes === 0) {
+      const request = this.database.prepare("SELECT id FROM task_resume_requests WHERE id = ?").get(id);
+      if (!request) {
+        throw new ApiError(404, "RESUME_REQUEST_NOT_FOUND", `Resume request '${id}' does not exist`);
+      }
+      throw new ApiError(409, "RESUME_LEASE_CONFLICT", "Resume request lease is no longer valid");
+    }
+    return taskResumeRequestFromRow(this.database.prepare(
+      "SELECT * FROM task_resume_requests WHERE id = ?",
+    ).get(id));
   }
 
   #attachmentsForComment(commentId) {
