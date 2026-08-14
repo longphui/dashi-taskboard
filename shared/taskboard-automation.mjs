@@ -135,8 +135,8 @@ export function taskboardAutomationPolicyOperation(request, {
   hasClaimableTodo,
 }) {
   if (!request.enabledByUser) return "pause";
-  if (request.quotaAware && quotaState !== "available") return "pause";
-  if (taskboardMode !== "cloud") {
+  if (taskboardMode === "local") {
+    if (request.quotaAware && quotaState !== "available") return "pause";
     return hasClaimableTodo ? "ensure-active" : "pause";
   }
   if (
@@ -144,6 +144,7 @@ export function taskboardAutomationPolicyOperation(request, {
     && currentStatus === "PAUSED"
     && (!request.quotaAware || previousQuotaState === "available")
   ) return "list";
+  if (request.quotaAware && quotaState !== "available") return "pause";
   if (
     explicit
     || currentStatus === undefined
