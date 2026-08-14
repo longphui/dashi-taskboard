@@ -506,6 +506,78 @@ function parseThreadId(value) {
   return stringField(value, "threadId", { required: true, maxLength: 256 });
 }
 
+function parseResumeClaim(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["projectIds", "leaseSeconds"]));
+  if (!Array.isArray(body.projectIds) || body.projectIds.length < 1 || body.projectIds.length > 100) {
+    throw new ApiError(400, "INVALID_FIELD", "'projectIds' must contain 1 to 100 project IDs");
+  }
+  const projectIds = body.projectIds.map((projectId) => validateProjectId(projectId));
+  if (new Set(projectIds).size !== projectIds.length) {
+    throw new ApiError(400, "INVALID_FIELD", "'projectIds' must be unique");
+  }
+  if (!Number.isSafeInteger(body.leaseSeconds) || body.leaseSeconds < 5 || body.leaseSeconds > 60) {
+    throw new ApiError(400, "INVALID_FIELD", "'leaseSeconds' must be an integer from 5 to 60");
+  }
+  return { projectIds, leaseSeconds: body.leaseSeconds };
+}
+
+function parseResumeDefer(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["leaseToken", "delaySeconds", "reason"]));
+  if (!Number.isSafeInteger(body.delaySeconds) || body.delaySeconds < 1 || body.delaySeconds > 300) {
+    throw new ApiError(400, "INVALID_FIELD", "'delaySeconds' must be an integer from 1 to 300");
+  }
+  return {
+    leaseToken: stringField(body.leaseToken, "leaseToken", { required: true, maxLength: 256 }),
+    delaySeconds: body.delaySeconds,
+    reason: stringField(body.reason, "reason", { required: true, maxLength: 1000 }),
+  };
+}
+
+function parseResumeDispatched(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["leaseToken", "turnId"]));
+  return {
+    leaseToken: stringField(body.leaseToken, "leaseToken", { required: true, maxLength: 256 }),
+    turnId: stringField(body.turnId, "turnId", { required: true, maxLength: 256 }),
+  };
+}
+
+function parseResumeFailed(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["leaseToken", "error", "retryAfterSeconds", "permanent"]));
+  if (!Number.isSafeInteger(body.retryAfterSeconds) || body.retryAfterSeconds < 1 || body.retryAfterSeconds > 300) {
+    throw new ApiError(400, "INVALID_FIELD", "'retryAfterSeconds' must be an integer from 1 to 300");
+  }
+  if (typeof body.permanent !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "'permanent' must be a boolean");
+  }
+  return {
+    leaseToken: stringField(body.leaseToken, "leaseToken", { required: true, maxLength: 256 }),
+    error: stringField(body.error, "error", { required: true, maxLength: 2000 }),
+    retryAfterSeconds: body.retryAfterSeconds,
+    permanent: body.permanent,
+  };
+}
+
+function parseResumeCanceled(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["leaseToken", "reason"]));
+  return {
+    leaseToken: stringField(body.leaseToken, "leaseToken", { required: true, maxLength: 256 }),
+    reason: stringField(body.reason, "reason", { required: true, maxLength: 1000 }),
+  };
+}
+
+function parseResumeRetry(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["requestId"]));
+  return {
+    requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
+  };
+}
+
 function requestHeader(request, name) {
   const value = request.headers[name];
   return Array.isArray(value) ? value[0] : value;
@@ -1393,6 +1465,12 @@ export function createTaskboardServer(options = {}) {
   const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
     configPath: resolved.cloudConfigPath,
   });
+  async function assertTaskResumeLocalMode() {
+    const config = await cloudConfig.read();
+    if (config.remoteUrl) {
+      throw new ApiError(409, "TASK_RESUME_LOCAL_MODE_REQUIRED", "原会话自动续跑仅支持本地任务数据模式");
+    }
+  }
   const jiraConfig = options.jiraConfigStore ?? createJiraConfigStore({
     configPath: resolved.jiraConfigPath,
   });
@@ -1960,6 +2038,61 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, projectSummary.get(projectId));
       }
 
+      if (pathname === "/api/local/task-resume-requests/claim") {
+        await assertTaskResumeLocalMode();
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/task-resume-requests/claim");
+        const { projectIds, leaseSeconds } = parseResumeClaim(await readJson(request));
+        const claim = database.claimTaskResumeRequest(projectIds, leaseSeconds);
+        if (!claim.request) return sendJson(response, 200, claim);
+        const task = database.getTask(claim.request.taskId);
+        events.emit("task.updated", { task });
+        return sendJson(response, 200, { ...claim, task });
+      }
+
+      if (pathname === "/api/local/task-resume-requests/open-thread-ids") {
+        await assertTaskResumeLocalMode();
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/task-resume-requests/open-thread-ids");
+        await assertEmptyRequestBody(request, "GET /api/local/task-resume-requests/open-thread-ids");
+        return sendJson(response, 200, { threadIds: database.listOpenTaskResumeThreadIds() });
+      }
+
+      const taskResumeRequestRoute = pathname.match(
+        /^\/api\/local\/task-resume-requests\/([^/]+)\/(defer|dispatched|failed|canceled)$/,
+      );
+      if (taskResumeRequestRoute) {
+        await assertTaskResumeLocalMode();
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/task-resume-requests/:id");
+        const requestId = decodeRouteSegment(taskResumeRequestRoute[1], "Resume request id");
+        const action = taskResumeRequestRoute[2];
+        const body = await readJson(request);
+        let resumeRequest;
+        if (action === "defer") {
+          const { leaseToken, delaySeconds, reason } = parseResumeDefer(body);
+          resumeRequest = database.deferTaskResumeRequest(requestId, leaseToken, delaySeconds, reason);
+        } else if (action === "dispatched") {
+          const { leaseToken, turnId } = parseResumeDispatched(body);
+          resumeRequest = database.markTaskResumeRequestDispatched(requestId, leaseToken, turnId);
+        } else if (action === "failed") {
+          const { leaseToken, error, retryAfterSeconds, permanent } = parseResumeFailed(body);
+          resumeRequest = database.failTaskResumeRequest(
+            requestId,
+            leaseToken,
+            error,
+            retryAfterSeconds,
+            permanent,
+          );
+        } else {
+          const { leaseToken, reason } = parseResumeCanceled(body);
+          resumeRequest = database.cancelTaskResumeRequest(requestId, leaseToken, reason);
+        }
+        const task = database.getTask(resumeRequest.taskId);
+        events.emit("task.updated", { task });
+        return sendJson(response, 200, { resumeRequest, task });
+      }
+
       if (pathname === "/api/local/ai/threads") {
         assertNoQuery(url.searchParams, "/api/local/ai/threads");
         if (request.method === "GET") {
@@ -2082,6 +2215,22 @@ export function createTaskboardServer(options = {}) {
             codexProcessEnvironment,
           ),
         );
+      }
+
+      const taskResumeRetryRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/resume\/retry$/);
+      if (taskResumeRetryRoute) {
+        await assertTaskResumeLocalMode();
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:taskId/resume/retry");
+        const taskId = decodeRouteSegment(taskResumeRetryRoute[1], "Task id");
+        if (taskId.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        const { requestId } = parseResumeRetry(await readJson(request));
+        const { resumeRequest } = database.retryTaskResumeRequest(taskId, requestId);
+        const task = database.getTask(resumeRequest.taskId);
+        events.emit("task.updated", { task });
+        return sendJson(response, 200, { task, resumeRequest });
       }
 
       let currentCloudConfig = null;
