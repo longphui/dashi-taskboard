@@ -11,6 +11,7 @@ import { resolvePort } from "../server/app.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import {
+  buildTaskboardAutomationName,
   parseTaskboardAutomationHostRequest,
   reconcileTaskboardAutomation,
   taskboardAutomationPolicyOperation,
@@ -101,6 +102,7 @@ const taskConversationAppServerTimeoutMs = 30_000;
 const taskResumeRetryDelays = [1, 5, 30];
 let taskResumeWorkerTimer = null;
 let taskResumeWorkerRunning = false;
+let lastTaskboardAutomationCleanupAt = 0;
 
 function parseArgs(argv) {
   const options = {
@@ -1318,6 +1320,54 @@ async function observeTaskResumeTurn(cdp, claim) {
   );
 }
 
+function threadIsAtLeastThirtySecondsOld(thread) {
+  const createdAt = typeof thread?.createdAt === "number"
+    ? thread.createdAt
+    : Date.parse(thread?.createdAt ?? "");
+  return Number.isFinite(createdAt) && Date.now() - createdAt >= 30_000;
+}
+
+async function cleanupUnusedTaskboardAutomationThreads(cdp) {
+  const metadata = await requestTaskboardJson("/api/meta");
+  if (metadata.mode === "cloud") return;
+
+  const [listedTasks, openResumeThreads] = await Promise.all([
+    requestTaskboardJson("/api/tasks?archived=all"),
+    requestTaskboardJson("/api/local/task-resume-requests/open-thread-ids"),
+  ]);
+  const protectedThreadIds = new Set([
+    ...(listedTasks.tasks ?? []).map((task) => task?.threadId),
+    ...(openResumeThreads.threadIds ?? []),
+  ].filter((threadId) => typeof threadId === "string" && threadId.length > 0));
+  const automationNames = new Set(
+    [...quotaPolicyRecords.values()].map((record) => buildTaskboardAutomationName(record.request)),
+  );
+
+  for (const automationName of automationNames) {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/list", {
+      archived: false,
+      searchTerm: automationName,
+      limit: 100,
+      sortDirection: "desc",
+      useStateDbOnly: true,
+    });
+    const candidates = Array.isArray(result?.data) ? result.data : [];
+    for (const thread of candidates) {
+      if (
+        typeof thread?.id !== "string"
+        || thread.id.length === 0
+        || thread.name !== automationName
+        || thread.status?.type !== "idle"
+        || !threadIsAtLeastThirtySecondsOld(thread)
+        || protectedThreadIds.has(thread.id)
+      ) continue;
+      await requestCodexAppServerViaCdp(cdp, undefined, "thread/archive", {
+        threadId: thread.id,
+      });
+    }
+  }
+}
+
 function scheduleTaskResumeWorker(cdp, delayMs) {
   if (taskResumeWorkerTimer) clearTimeout(taskResumeWorkerTimer);
   taskResumeWorkerTimer = setTimeout(() => {
@@ -1344,6 +1394,10 @@ async function runTaskResumeWorkerPass(cdp) {
   try {
     const metadata = await requestTaskboardJson("/api/meta");
     if (metadata.mode === "cloud") return;
+    if (Date.now() - lastTaskboardAutomationCleanupAt >= 60_000) {
+      lastTaskboardAutomationCleanupAt = Date.now();
+      await cleanupUnusedTaskboardAutomationThreads(cdp);
+    }
     const projectIds = [...quotaPolicyRecords.values()]
       .filter((record) => record.request.enabledByUser === true)
       .map((record) => record.request.taskboardProjectId);
