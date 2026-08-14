@@ -266,6 +266,9 @@
     if (plugin && plugin.parentElement) {
       const siblings = Array.from(plugin.parentElement.children).filter((child) => child.tagName === "BUTTON");
       if (siblings.length >= 3) return plugin;
+      const wrappedSiblings = Array.from(plugin.parentElement.parentElement?.children || [])
+        .filter((child) => child.children.length === 1 && child.firstElementChild?.tagName === "BUTTON");
+      if (wrappedSiblings.length >= 3) return plugin;
     }
 
     const firstSection = scroll.querySelector("[data-app-action-sidebar-section]");
