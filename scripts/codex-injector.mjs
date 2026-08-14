@@ -1221,7 +1221,6 @@ async function readTaskResumeSandboxPolicy(thread) {
     try {
       let offset = rolloutStat.size;
       let remainder = Buffer.alloc(0);
-      let skipRemainder = false;
       while (offset > 0) {
         const bytesToRead = Math.min(offset, taskResumeRolloutChunkBytes);
         offset -= bytesToRead;
@@ -1233,43 +1232,40 @@ async function readTaskResumeSandboxPolicy(thread) {
         let end = contents.length;
         let newline = contents.lastIndexOf(0x0a, end - 1);
         while (newline !== -1) {
-          if (!skipRemainder) {
-            try {
-              const event = JSON.parse(contents.subarray(newline + 1, end).toString("utf8"));
-              if (event?.type === "turn_context") {
-                const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
-                if (policy) return policy;
-                throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
-              }
-            } catch (error) {
-              if (error?.taskResumePermanent === true) throw error;
+          const line = contents.subarray(newline + 1, end);
+          if (line.length > taskResumeRolloutMaxLineBytes) {
+            throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
+          }
+          try {
+            const event = JSON.parse(line.toString("utf8"));
+            if (event?.type === "turn_context") {
+              const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
+              if (policy) return policy;
+              throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
             }
-          } else {
-            skipRemainder = false;
+          } catch (error) {
+            if (error?.taskResumePermanent === true) throw error;
           }
           end = newline;
           newline = contents.lastIndexOf(0x0a, end - 1);
         }
         if (offset === 0) {
-          if (!skipRemainder) {
-            try {
-              const event = JSON.parse(contents.subarray(0, end).toString("utf8"));
-              if (event?.type === "turn_context") {
-                const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
-                if (policy) return policy;
-              }
-            } catch {}
+          if (end > taskResumeRolloutMaxLineBytes) {
+            throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
           }
+          try {
+            const event = JSON.parse(contents.subarray(0, end).toString("utf8"));
+            if (event?.type === "turn_context") {
+              const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
+              if (policy) return policy;
+            }
+          } catch {}
           break;
         }
-        if (skipRemainder) {
-          remainder = Buffer.alloc(0);
-        } else if (end > taskResumeRolloutMaxLineBytes) {
-          remainder = Buffer.alloc(0);
-          skipRemainder = true;
-        } else {
-          remainder = Buffer.from(contents.subarray(0, end));
+        if (end > taskResumeRolloutMaxLineBytes) {
+          throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
         }
+        remainder = Buffer.from(contents.subarray(0, end));
       }
     } finally {
       await handle.close();
