@@ -1147,8 +1147,8 @@ function isTaskResumeTransientError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return error?.taskResumeTransient === true
     || error?.name === "TimeoutError"
-    || error?.code === "INTERNAL_ERROR"
-    || /\b(system\s*error|timed out|fetch failed|network)\b/i.test(message);
+    || /^(?:internal_error|system_?error)$/i.test(String(error?.code ?? ""))
+    || /\b(system[\s_-]*error|CDP WebSocket closed|timed out|fetch failed|network)\b/i.test(message);
 }
 
 function taskResumeFailureMessage(error) {
@@ -1225,6 +1225,10 @@ async function deliverTaskResumeRequest(cdp, claim) {
   }
 
   let thread = await readTaskResumeThread(cdp, request);
+  if (thread.status?.type === "active") {
+    await deferTaskResumeRequest(claim, "Original thread is active");
+    return;
+  }
   if (thread.status?.type === "notLoaded" || thread.canAcceptDirectInput !== true) {
     await requestCodexAppServerViaCdp(cdp, undefined, "thread/resume", {
       threadId: request.threadId,
