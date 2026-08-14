@@ -135,6 +135,7 @@ function taskResumeRequestFromRow(row) {
     status: row.status,
     attemptCount: row.attempt_count,
     nextAttemptAt: row.next_attempt_at,
+    dispatchedAt: row.dispatched_at,
     turnId: row.turn_id,
     retryOfRequestId: row.retry_of_request_id,
     lastError: row.last_error,
@@ -1707,7 +1708,11 @@ export class TaskboardDatabase {
             OR (task_resume_requests.status = 'dispatching' AND task_resume_requests.lease_expires_at <= ?)
             OR (task_resume_requests.status = 'dispatched' AND task_resume_requests.next_attempt_at <= ?)
           )
-        ORDER BY task_resume_requests.created_at, task_resume_requests.rowid
+        ORDER BY CASE task_resume_requests.status
+          WHEN 'pending' THEN task_resume_requests.next_attempt_at
+          WHEN 'dispatching' THEN task_resume_requests.lease_expires_at
+          WHEN 'dispatched' THEN task_resume_requests.next_attempt_at
+        END, task_resume_requests.created_at, task_resume_requests.id
         LIMIT 1
       `).get(...projectIds, timestamp, timestamp, timestamp);
       if (!request) {

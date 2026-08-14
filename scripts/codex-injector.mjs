@@ -101,6 +101,9 @@ let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
 const taskResumeRetryDelays = [1, 5, 30];
+const taskResumeTurnListLimit = 100;
+const taskResumeTurnListMaxPages = 100;
+const taskResumeTurnVisibilityGraceMs = 10_000;
 const taskResumeRolloutTailBytes = 1_048_576;
 const taskResumeRolloutRoots = [
   path.join(homedir(), ".codex", "sessions"),
@@ -1123,11 +1126,15 @@ function isClaimableUnboundTodo(task) {
   return task.status === "todo"
     && !task.archivedAt
     && !task.threadId
-    && task.relations.blockedBy.every((dependency) => dependency.status === "done");
+    && taskDependenciesAreDone(task);
+}
+
+function taskDependenciesAreDone(task) {
+  return task.relations.blockedBy.every((dependency) => dependency.status === "done");
 }
 
 function buildTaskResumePrompt(task, request) {
-  return `e-taskboard 任务 ${task.identifier} 已被用户退回待办。请读取最新议题和全部评论；仅当任务仍为 todo 且绑定当前会话时，使用最新 version 认领为 in_progress，然后按最新评论继续处理。续跑请求：${request.id}。`;
+  return `e-taskboard 任务 ${task.identifier} 已被用户退回待办。请读取最新议题和全部评论；认领前再次读取任务依赖，确认所有 blockedBy 均为 done；仅当任务仍为 todo、绑定当前会话且依赖已完成时，使用最新 version 认领为 in_progress，然后按最新评论继续处理。续跑请求：${request.id}。`;
 }
 
 function isPathWithinDirectory(filePath, directory) {
@@ -1332,8 +1339,13 @@ async function readTaskResumeThread(cdp, request) {
 
 async function deliverTaskResumeRequest(cdp, claim) {
   const { request } = claim;
-  if (!taskResumeRequestMatchesTask(claim.task, request)) {
+  const task = await readTaskResumeTask(request);
+  if (!taskResumeRequestMatchesTask(task, request)) {
     await cancelTaskResumeRequest(claim, "Task no longer matches its resume request");
+    return;
+  }
+  if (!taskDependenciesAreDone(task)) {
+    await deferTaskResumeRequest(claim, "Task dependencies are not done");
     return;
   }
 
@@ -1371,7 +1383,7 @@ async function deliverTaskResumeRequest(cdp, claim) {
   const result = await requestCodexAppServerViaCdp(cdp, undefined, "turn/start", {
     threadId: request.threadId,
     clientUserMessageId: request.id,
-    input: [{ type: "text", text: buildTaskResumePrompt(claim.task, request), text_elements: [] }],
+    input: [{ type: "text", text: buildTaskResumePrompt(task, request), text_elements: [] }],
     ...(sandboxPolicy ? { sandboxPolicy } : {}),
   });
   const turnId = result?.turn?.id;
@@ -1395,17 +1407,48 @@ async function observeTaskResumeTurn(cdp, claim) {
     return;
   }
 
-  const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/turns/list", {
-    threadId: request.threadId,
-    limit: 20,
-    sortDirection: "desc",
-    itemsView: "summary",
-  });
-  const turn = Array.isArray(result?.data)
-    ? result.data.find((candidate) => candidate?.id === request.turnId)
-    : null;
-  if (!turn || turn.status === "inProgress") {
-    await deferTaskResumeRequest(claim, turn ? "Original thread turn is in progress" : "Original thread turn is not visible yet");
+  let cursor;
+  let turn = null;
+  let turnsExhausted = false;
+  for (let page = 0; page < taskResumeTurnListMaxPages; page += 1) {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/turns/list", {
+      threadId: request.threadId,
+      limit: taskResumeTurnListLimit,
+      sortDirection: "desc",
+      itemsView: "summary",
+      ...(cursor ? { cursor } : {}),
+    });
+    turn = Array.isArray(result?.data)
+      ? result.data.find((candidate) => candidate?.id === request.turnId)
+      : null;
+    if (turn) break;
+    cursor = typeof result?.nextCursor === "string" && result.nextCursor.length > 0
+      ? result.nextCursor
+      : null;
+    if (!cursor) {
+      turnsExhausted = true;
+      break;
+    }
+  }
+  if (!turn) {
+    const dispatchedAt = Date.parse(request.dispatchedAt ?? "");
+    if (Number.isFinite(dispatchedAt) && Date.now() - dispatchedAt < taskResumeTurnVisibilityGraceMs) {
+      await deferTaskResumeRequest(claim, "Original thread turn is not visible yet");
+      return;
+    }
+    await failTaskResumeRequest(
+      claim,
+      taskResumePermanentError(
+        turnsExhausted
+          ? "Original thread turn is not visible"
+          : "Original thread turn exceeded the observation page limit",
+      ),
+      true,
+    );
+    return;
+  }
+  if (turn.status === "inProgress") {
+    await deferTaskResumeRequest(claim, "Original thread turn is in progress");
     return;
   }
   if (!["completed", "interrupted", "failed"].includes(turn.status)) {
