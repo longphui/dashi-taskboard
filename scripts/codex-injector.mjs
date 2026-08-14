@@ -98,6 +98,9 @@ const quotaPolicyRestorePromises = new WeakMap();
 let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
+const taskResumeRetryDelays = [1, 5, 30];
+let taskResumeWorkerTimer = null;
+let taskResumeWorkerRunning = false;
 
 function parseArgs(argv) {
   const options = {
@@ -1087,6 +1090,282 @@ async function requestCodexAppServerViaCdp(
   return response.result;
 }
 
+async function requestTaskboardJson(pathname, { method = "GET", body } = {}) {
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    method,
+    headers: { "content-type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {}
+  if (!response.ok) {
+    const code = payload?.error?.code || "TASKBOARD_REQUEST_FAILED";
+    const message = payload?.error?.message || `Taskboard returned HTTP ${response.status}`;
+    const error = new Error(`Taskboard ${code}: ${message}`);
+    error.code = code;
+    throw error;
+  }
+  return payload ?? {};
+}
+
+function buildTaskResumePrompt(task, request) {
+  return `e-taskboard 任务 ${task.identifier} 已被用户退回待办。请读取最新议题和全部评论；仅当任务仍为 todo 且绑定当前会话时，使用最新 version 认领为 in_progress，然后按最新评论继续处理。续跑请求：${request.id}。`;
+}
+
+function taskResumeRequestMatchesTask(task, request) {
+  return task?.status === "todo"
+    && task.archivedAt == null
+    && task.projectId === request.projectId
+    && task.threadId === request.threadId;
+}
+
+function taskResumeRequestAcknowledged(task, request) {
+  return task?.status === "in_progress"
+    && task.projectId === request.projectId
+    && task.threadId === request.threadId
+    && task.resumeRequest?.id === request.id
+    && task.resumeRequest.status === "acknowledged"
+    && task.resumeRequest.threadId === request.threadId;
+}
+
+function taskResumePermanentError(message) {
+  const error = new Error(message);
+  error.taskResumePermanent = true;
+  return error;
+}
+
+function taskResumeTransientError(message) {
+  const error = new Error(message);
+  error.taskResumeTransient = true;
+  return error;
+}
+
+function isTaskResumeTransientError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return error?.taskResumeTransient === true
+    || error?.name === "TimeoutError"
+    || error?.code === "INTERNAL_ERROR"
+    || /\b(system\s*error|timed out|fetch failed|network)\b/i.test(message);
+}
+
+function taskResumeFailureMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 2_000) || "Original thread resume failed";
+}
+
+async function readTaskResumeTask(request) {
+  const result = await requestTaskboardJson(`/api/tasks/${encodeURIComponent(request.taskId)}`);
+  if (!result?.task) throw taskResumePermanentError("Taskboard did not return the resume task");
+  return result.task;
+}
+
+async function mutateTaskResumeRequest(claim, action, body) {
+  return requestTaskboardJson(
+    `/api/local/task-resume-requests/${encodeURIComponent(claim.request.id)}/${action}`,
+    {
+      method: "POST",
+      body: { leaseToken: claim.leaseToken, ...body },
+    },
+  );
+}
+
+async function deferTaskResumeRequest(claim, reason) {
+  return mutateTaskResumeRequest(claim, "defer", { delaySeconds: 2, reason });
+}
+
+async function cancelTaskResumeRequest(claim, reason) {
+  return mutateTaskResumeRequest(claim, "canceled", { reason });
+}
+
+async function failTaskResumeRequest(claim, error, permanent = false) {
+  const { request } = claim;
+  const retryAfterSeconds = taskResumeRetryDelays[request.attemptCount]
+    ?? taskResumeRetryDelays.at(-1);
+  return mutateTaskResumeRequest(claim, "failed", {
+    error: taskResumeFailureMessage(error),
+    retryAfterSeconds,
+    permanent: permanent || request.attemptCount >= taskResumeRetryDelays.length,
+  });
+}
+
+async function readTaskResumeThread(cdp, request) {
+  const read = async () => {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/read", {
+      threadId: request.threadId,
+      includeTurns: false,
+    });
+    if (!result?.thread) throw taskResumePermanentError("Original thread is unavailable");
+    return result.thread;
+  };
+  try {
+    return await read();
+  } catch {
+    try {
+      await requestCodexAppServerViaCdp(cdp, undefined, "thread/unarchive", {
+        threadId: request.threadId,
+      });
+    } catch {}
+    try {
+      return await read();
+    } catch (error) {
+      if (isTaskResumeTransientError(error)) throw error;
+      throw taskResumePermanentError("Original thread is unavailable");
+    }
+  }
+}
+
+async function deliverTaskResumeRequest(cdp, claim) {
+  const { request } = claim;
+  if (!taskResumeRequestMatchesTask(claim.task, request)) {
+    await cancelTaskResumeRequest(claim, "Task no longer matches its resume request");
+    return;
+  }
+
+  let thread = await readTaskResumeThread(cdp, request);
+  if (thread.status?.type === "notLoaded" || thread.canAcceptDirectInput !== true) {
+    await requestCodexAppServerViaCdp(cdp, undefined, "thread/resume", {
+      threadId: request.threadId,
+      excludeTurns: true,
+    });
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/read", {
+      threadId: request.threadId,
+      includeTurns: false,
+    });
+    thread = result?.thread;
+  }
+
+  if (thread?.status?.type === "active") {
+    await deferTaskResumeRequest(claim, "Original thread is active");
+    return;
+  }
+  if (thread?.status?.type !== "idle" || thread.canAcceptDirectInput !== true) {
+    await failTaskResumeRequest(
+      claim,
+      taskResumePermanentError("Original thread cannot accept direct input"),
+      true,
+    );
+    return;
+  }
+
+  const result = await requestCodexAppServerViaCdp(cdp, undefined, "turn/start", {
+    threadId: request.threadId,
+    clientUserMessageId: request.id,
+    input: [{ type: "text", text: buildTaskResumePrompt(claim.task, request), text_elements: [] }],
+  });
+  const turnId = result?.turn?.id;
+  if (!turnId) throw taskResumeTransientError("Original thread did not return a turn ID");
+  try {
+    await mutateTaskResumeRequest(claim, "dispatched", { turnId });
+  } catch (error) {
+    if (error?.code !== "RESUME_LEASE_CONFLICT") throw error;
+    const task = await readTaskResumeTask(request);
+    if (taskResumeRequestAcknowledged(task, request)) return;
+    throw error;
+  }
+}
+
+async function observeTaskResumeTurn(cdp, claim) {
+  const { request } = claim;
+  let task = await readTaskResumeTask(request);
+  if (taskResumeRequestAcknowledged(task, request)) return;
+  if (!taskResumeRequestMatchesTask(task, request)) {
+    await cancelTaskResumeRequest(claim, "Task no longer matches its resume request");
+    return;
+  }
+
+  const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/turns/list", {
+    threadId: request.threadId,
+    limit: 20,
+    sortDirection: "desc",
+    itemsView: "summary",
+  });
+  const turn = Array.isArray(result?.data)
+    ? result.data.find((candidate) => candidate?.id === request.turnId)
+    : null;
+  if (!turn || turn.status === "inProgress") {
+    await deferTaskResumeRequest(claim, turn ? "Original thread turn is in progress" : "Original thread turn is not visible yet");
+    return;
+  }
+  if (!["completed", "interrupted", "failed"].includes(turn.status)) {
+    await deferTaskResumeRequest(claim, "Original thread turn has an unknown status");
+    return;
+  }
+
+  task = await readTaskResumeTask(request);
+  if (taskResumeRequestAcknowledged(task, request)) return;
+  if (!taskResumeRequestMatchesTask(task, request)) {
+    await cancelTaskResumeRequest(claim, "Task no longer matches its resume request");
+    return;
+  }
+  await failTaskResumeRequest(
+    claim,
+    taskResumePermanentError(`Original thread did not claim the task (${turn.status})`),
+    true,
+  );
+}
+
+function scheduleTaskResumeWorker(cdp, delayMs) {
+  if (taskResumeWorkerTimer) clearTimeout(taskResumeWorkerTimer);
+  taskResumeWorkerTimer = setTimeout(() => {
+    taskResumeWorkerTimer = null;
+    const workerCdp = cdp && !cdp.closed
+      ? cdp
+      : (() => {
+        try {
+          return currentQuotaPolicyCdp();
+        } catch {
+          return null;
+        }
+      })();
+    if (workerCdp) void runTaskResumeWorkerPass(workerCdp);
+  }, delayMs);
+  taskResumeWorkerTimer.unref();
+}
+
+async function runTaskResumeWorkerPass(cdp) {
+  if (taskResumeWorkerRunning) return;
+  taskResumeWorkerRunning = true;
+  let nextDelayMs = 10_000;
+  let claim = null;
+  try {
+    const metadata = await requestTaskboardJson("/api/meta");
+    if (metadata.mode === "cloud") return;
+    const projectIds = [...quotaPolicyRecords.values()]
+      .filter((record) => record.request.enabledByUser === true)
+      .map((record) => record.request.taskboardProjectId);
+    if (projectIds.length === 0) return;
+
+    nextDelayMs = 2_000;
+    claim = await requestTaskboardJson("/api/local/task-resume-requests/claim", {
+      method: "POST",
+      body: { projectIds, leaseSeconds: 60 },
+    });
+    if (!claim.request) {
+      nextDelayMs = 10_000;
+      return;
+    }
+    if (claim.operation === "observe") await observeTaskResumeTurn(cdp, claim);
+    else await deliverTaskResumeRequest(cdp, claim);
+  } catch (error) {
+    if (claim?.request) {
+      try {
+        await failTaskResumeRequest(
+          claim,
+          error,
+          error?.taskResumePermanent === true || !isTaskResumeTransientError(error),
+        );
+      } catch {}
+    }
+    console.error("Taskboard original-thread resume worker pass failed");
+  } finally {
+    taskResumeWorkerRunning = false;
+    scheduleTaskResumeWorker(cdp, nextDelayMs);
+  }
+}
+
 async function applyTaskboardAutomationPolicy(
   request,
   rpc,
@@ -1611,6 +1890,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         returnByValue: true,
       });
       await restoreQuotaPolicies(cdp);
+      scheduleTaskResumeWorker(cdp, 2_000);
       return activeContextId;
     })();
     try {
