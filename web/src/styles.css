@@ -2780,6 +2780,31 @@ kbd {
   margin-top: 18px;
 }
 
+.task-resume-status,
+.issue-resume-status {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.task-resume-status.is-failed,
+.issue-resume-status.is-failed {
+  color: var(--danger);
+}
+
+.issue-resume-error {
+  max-width: 100%;
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+}
+
+.issue-resume-retry {
+  min-height: 28px;
+}
+
 .issue-conversation-link {
   display: inline-flex;
   align-items: center;

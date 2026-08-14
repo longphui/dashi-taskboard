@@ -219,6 +219,25 @@ export interface TaskConversationRef {
   updatedAt: string;
 }
 
+export type TaskResumeRequestStatus =
+  | "pending"
+  | "dispatching"
+  | "dispatched"
+  | "acknowledged"
+  | "failed"
+  | "canceled";
+
+export interface TaskResumeRequest {
+  id: string;
+  status: TaskResumeRequestStatus;
+  attemptCount: number;
+  nextAttemptAt: string;
+  turnId: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Task {
   id: string;
   identifier: string;
@@ -231,6 +250,7 @@ export interface Task {
   sortOrder: number;
   threadId: string | null;
   conversationRefs: TaskConversationRef[];
+  resumeRequest?: TaskResumeRequest | null;
   participants: ActorIdentity[];
   previewImage: Attachment | null;
   activityKey: string;

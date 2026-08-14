@@ -190,6 +190,26 @@ function ProcessingStatusRow({
   );
 }
 
+function TaskResumeStatus({ task }: { task: Task }) {
+  const { text } = useTaskboardI18n();
+  const resumeRequest = task.resumeRequest;
+  if (!resumeRequest) return null;
+  const label = {
+    pending: text("等待原会话空闲", "Waiting for original thread"),
+    dispatching: text("正在唤醒原会话", "Resuming original thread"),
+    dispatched: text("已发送，等待原会话认领", "Sent; waiting for original thread"),
+    acknowledged: text("原会话已继续处理", "Original thread resumed"),
+    failed: text("交接失败", "Resume failed"),
+    canceled: text("交接已取消", "Resume canceled"),
+  }[resumeRequest.status];
+
+  return (
+    <span className={`task-resume-status${resumeRequest.status === "failed" ? " is-failed" : ""}`}>
+      {label}
+    </span>
+  );
+}
+
 function ParticipantAvatars({ participants }: { participants: ActorIdentity[] }) {
   const { text } = useTaskboardI18n();
   if (participants.length === 0) return null;
@@ -457,6 +477,10 @@ export function TaskCard({
       </div>
 
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
+
+      {(task.status === "todo" || task.status === "in_progress") && task.resumeRequest && (
+        <TaskResumeStatus task={task} />
+      )}
 
       {image && (
         <TaskCardMedia key={image} src={image} />

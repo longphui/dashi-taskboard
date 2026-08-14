@@ -40,6 +40,7 @@ import type {
   TaskDraft,
   TaskPriority,
   TaskRelationSummary,
+  TaskResumeRequestStatus,
   TaskStatus,
 } from "../types";
 import {
@@ -93,6 +94,7 @@ interface TaskDetailProps {
   onCreateLabel: (label: string) => Promise<void>;
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+  onRetryResume: (task: Task) => Promise<Task>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onAddRelation: (
     task: Task,
@@ -115,6 +117,17 @@ function messageFor(error: unknown): TaskDetailError {
   if (error instanceof ApiError) return error.message;
   if (error instanceof Error) return error.message;
   return ["操作未完成，请重试。", "The action could not be completed. Try again."];
+}
+
+function resumeStatusLabel(status: TaskResumeRequestStatus, text: (zh: string, en: string) => string) {
+  return {
+    pending: text("等待原会话空闲", "Waiting for original thread"),
+    dispatching: text("正在唤醒原会话", "Resuming original thread"),
+    dispatched: text("已发送，等待原会话认领", "Sent; waiting for original thread"),
+    acknowledged: text("原会话已继续处理", "Original thread resumed"),
+    failed: text("交接失败", "Resume failed"),
+    canceled: text("交接已取消", "Resume canceled"),
+  }[status];
 }
 
 function issueMessageFor(error: unknown): TaskDetailError {
@@ -411,6 +424,7 @@ export function TaskDetail({
   onCreateLabel,
   onDeleteLabel,
   onUpdate,
+  onRetryResume,
   onOpenTask,
   onAddRelation,
   onRemoveRelation,
@@ -430,6 +444,7 @@ export function TaskDetail({
   const [editingDescription, setEditingDescription] = useState(false);
   const [propertyMenu, setPropertyMenu] = useState<"status" | "priority" | "assignee" | "labels" | null>(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
+  const [retryingResume, setRetryingResume] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentsLoading, setAttachmentsLoading] = useState(true);
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
@@ -469,6 +484,14 @@ export function TaskDetail({
   const editingDraft = serializeInlineMedia(editingSegments);
   const displayIdentifier = currentTask.externalKey ?? currentTask.identifier;
   const editingInlineImages = inlineMediaImages(editingSegments);
+
+  function retryResume() {
+    setRetryingResume(true);
+    void onRetryResume(currentTask)
+      .then(setCurrentTask)
+      .catch(() => {})
+      .finally(() => setRetryingResume(false));
+  }
 
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
@@ -995,12 +1018,34 @@ export function TaskDetail({
                       : text("添加描述…", "Add description…")}
                   </div>
                 )}
-                {currentTask.threadId && (
+                {(currentTask.threadId || currentTask.resumeRequest) && (
                   <div
                     className="issue-conversation-list"
                     aria-label={text("处理此议题的对话", "Conversations for this issue")}
                   >
-                    <ConversationLink threadId={currentTask.threadId} onOpen={onOpenThread} />
+                    {currentTask.threadId && (
+                      <ConversationLink threadId={currentTask.threadId} onOpen={onOpenThread} />
+                    )}
+                    {currentTask.resumeRequest && (
+                      <span className={`issue-resume-status${currentTask.resumeRequest.status === "failed" ? " is-failed" : ""}`}>
+                        {resumeStatusLabel(currentTask.resumeRequest.status, text)}
+                      </span>
+                    )}
+                    {currentTask.resumeRequest?.status === "failed" && (
+                      <>
+                        {currentTask.resumeRequest.lastError && (
+                          <p className="issue-resume-error">{currentTask.resumeRequest.lastError}</p>
+                        )}
+                        <button
+                          className="button secondary issue-resume-retry"
+                          type="button"
+                          disabled={retryingResume}
+                          onClick={retryResume}
+                        >
+                          {text("重试原会话", "Retry original thread")}
+                        </button>
+                      </>
+                    )}
                   </div>
                 )}
               </div>

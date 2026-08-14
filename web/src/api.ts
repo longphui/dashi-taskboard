@@ -478,6 +478,14 @@ export async function updateTask(task: Task, draft: TaskDraft, threadId?: string
   return data.task;
 }
 
+export async function retryTaskResume(task: Task, requestId: string): Promise<Task> {
+  const data = await request<{ task: Task }>(
+    `/api/tasks/${encodeURIComponent(task.id)}/resume/retry`,
+    { method: "POST", body: JSON.stringify({ requestId }) },
+  );
+  return data.task;
+}
+
 export async function moveTask(
   task: Task,
   status: TaskStatus,

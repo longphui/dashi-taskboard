@@ -44,6 +44,7 @@ import {
   moveTask as moveTaskRequest,
   publishHostRuntime,
   removeTaskRelation,
+  retryTaskResume,
   resolveTaskboardUrl,
   restoreTask as restoreTaskRequest,
   setApiText,
@@ -2237,6 +2238,22 @@ export function App() {
     }
   }
 
+  async function retryTaskResumeRequest(task: Task): Promise<Task> {
+    const resumeRequest = task.resumeRequest;
+    if (resumeRequest?.status !== "failed") return task;
+    setActionError(null);
+    try {
+      const updated = await retryTaskResume(task, resumeRequest.id);
+      setTasks((current) => sortTasks(current.map((candidate) =>
+        candidate.id === updated.id ? updated : candidate,
+      )));
+      return updated;
+    } catch (error) {
+      setActionError(errorMessage(error));
+      throw error;
+    }
+  }
+
   async function persistProjectLabel(label: string) {
     setActionError(null);
     try {
@@ -3017,6 +3034,7 @@ export function App() {
             onCreateLabel={persistProjectLabel}
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
+            onRetryResume={retryTaskResumeRequest}
             onOpenTask={openTaskDetail}
             onAddRelation={(current, type, relatedTaskId) => (
               mutateTaskRelation("add", current, type, relatedTaskId)
