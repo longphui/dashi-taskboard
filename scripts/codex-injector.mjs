@@ -1221,7 +1221,16 @@ async function readTaskResumeThread(cdp, request) {
       return await read();
     } catch (error) {
       if (isTaskResumeTransientError(error)) throw error;
-      throw taskResumePermanentError("Original thread is unavailable");
+      try {
+        await requestCodexAppServerViaCdp(cdp, undefined, "thread/resume", {
+          threadId: request.threadId,
+          excludeTurns: true,
+        });
+        return await read();
+      } catch (resumeError) {
+        if (isTaskResumeTransientError(resumeError)) throw resumeError;
+        throw taskResumePermanentError("Original thread is unavailable");
+      }
     }
   }
 }
