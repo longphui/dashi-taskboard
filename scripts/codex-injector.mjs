@@ -1322,7 +1322,7 @@ async function observeTaskResumeTurn(cdp, claim) {
 
 function threadIsAtLeastThirtySecondsOld(thread) {
   const createdAt = typeof thread?.createdAt === "number"
-    ? thread.createdAt
+    ? thread.createdAt * 1_000
     : Date.parse(thread?.createdAt ?? "");
   return Number.isFinite(createdAt) && Date.now() - createdAt >= 30_000;
 }
