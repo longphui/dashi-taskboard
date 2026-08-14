@@ -104,10 +104,12 @@ const taskResumeRetryDelays = [1, 5, 30];
 const taskResumeTurnListLimit = 100;
 const taskResumeTurnListMaxPages = 100;
 const taskResumeTurnVisibilityGraceMs = 10_000;
-const taskResumeRolloutTailBytes = 1_048_576;
+const taskResumeRolloutChunkBytes = 65_536;
+const taskResumeRolloutMaxLineBytes = 1_048_576;
+const taskResumeCodexHome = process.env.CODEX_HOME || path.join(homedir(), ".codex");
 const taskResumeRolloutRoots = [
-  path.join(homedir(), ".codex", "sessions"),
-  path.join(homedir(), ".codex", "archived_sessions"),
+  path.join(taskResumeCodexHome, "sessions"),
+  path.join(taskResumeCodexHome, "archived_sessions"),
 ];
 let taskResumeWorkerTimer = null;
 let taskResumeWorkerRunning = false;
@@ -1190,40 +1192,90 @@ async function readTaskResumeSandboxPolicy(thread) {
   if (threadPolicy) return threadPolicy;
 
   const rolloutPath = typeof thread?.path === "string" ? thread.path : "";
-  if (!rolloutPath.endsWith(".jsonl")) return null;
+  if (!rolloutPath.endsWith(".jsonl")) {
+    throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
+  }
   const allowedRoot = taskResumeRolloutRoots.find((root) => (
-    isPathWithinDirectory(path.resolve(rolloutPath), root)
+    isPathWithinDirectory(path.resolve(rolloutPath), path.resolve(root))
   ));
-  if (!allowedRoot) return null;
+  if (!allowedRoot) {
+    throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
+  }
 
   try {
     const [resolvedRoot, resolvedPath] = await Promise.all([
       realpath(allowedRoot),
       realpath(rolloutPath),
     ]);
-    if (!isPathWithinDirectory(resolvedPath, resolvedRoot)) return null;
+    if (!isPathWithinDirectory(resolvedPath, resolvedRoot)) {
+      throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
+    }
     const rolloutStat = await stat(resolvedPath);
-    if (!rolloutStat.isFile() || rolloutStat.size === 0) return null;
+    if (!rolloutStat.isFile() || rolloutStat.size === 0) {
+      throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
+    }
 
-    const bytesToRead = Math.min(rolloutStat.size, taskResumeRolloutTailBytes);
-    const buffer = Buffer.alloc(bytesToRead);
     const handle = await open(resolvedPath, "r");
     try {
-      await handle.read(buffer, 0, bytesToRead, rolloutStat.size - bytesToRead);
+      let offset = rolloutStat.size;
+      let remainder = Buffer.alloc(0);
+      let skipRemainder = false;
+      while (offset > 0) {
+        const bytesToRead = Math.min(offset, taskResumeRolloutChunkBytes);
+        offset -= bytesToRead;
+        const buffer = Buffer.allocUnsafe(bytesToRead);
+        const { bytesRead } = await handle.read(buffer, 0, bytesToRead, offset);
+        const contents = remainder.length > 0
+          ? Buffer.concat([buffer.subarray(0, bytesRead), remainder])
+          : buffer.subarray(0, bytesRead);
+        let end = contents.length;
+        let newline = contents.lastIndexOf(0x0a, end - 1);
+        while (newline !== -1) {
+          if (!skipRemainder) {
+            try {
+              const event = JSON.parse(contents.subarray(newline + 1, end).toString("utf8"));
+              if (event?.type === "turn_context") {
+                const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
+                if (policy) return policy;
+                throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
+              }
+            } catch (error) {
+              if (error?.taskResumePermanent === true) throw error;
+            }
+          } else {
+            skipRemainder = false;
+          }
+          end = newline;
+          newline = contents.lastIndexOf(0x0a, end - 1);
+        }
+        if (offset === 0) {
+          if (!skipRemainder) {
+            try {
+              const event = JSON.parse(contents.subarray(0, end).toString("utf8"));
+              if (event?.type === "turn_context") {
+                const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
+                if (policy) return policy;
+              }
+            } catch {}
+          }
+          break;
+        }
+        if (skipRemainder) {
+          remainder = Buffer.alloc(0);
+        } else if (end > taskResumeRolloutMaxLineBytes) {
+          remainder = Buffer.alloc(0);
+          skipRemainder = true;
+        } else {
+          remainder = Buffer.from(contents.subarray(0, end));
+        }
+      }
     } finally {
       await handle.close();
     }
-    const lines = buffer.toString("utf8").split("\n");
-    for (let index = lines.length - 1; index >= 0; index -= 1) {
-      try {
-        const event = JSON.parse(lines[index]);
-        if (event?.type !== "turn_context") continue;
-        const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
-        if (policy) return policy;
-      } catch {}
-    }
-  } catch {}
-  return null;
+  } catch (error) {
+    if (error?.taskResumePermanent === true) throw error;
+  }
+  throw taskResumePermanentError("Original thread sandbox policy cannot be recovered");
 }
 
 function taskResumeRequestMatchesTask(task, request) {
@@ -1384,7 +1436,7 @@ async function deliverTaskResumeRequest(cdp, claim) {
     threadId: request.threadId,
     clientUserMessageId: request.id,
     input: [{ type: "text", text: buildTaskResumePrompt(task, request), text_elements: [] }],
-    ...(sandboxPolicy ? { sandboxPolicy } : {}),
+    sandboxPolicy,
   });
   const turnId = result?.turn?.id;
   if (!turnId) throw taskResumeTransientError("Original thread did not return a turn ID");
@@ -1486,6 +1538,11 @@ async function cleanupUnusedTaskboardAutomationThreads(cdp) {
   ]);
   const protectedThreadIds = new Set([
     ...(listedTasks.tasks ?? []).map((task) => task?.threadId),
+    ...(listedTasks.tasks ?? []).flatMap((task) => (
+      Array.isArray(task?.conversationRefs)
+        ? task.conversationRefs.map((reference) => reference?.threadId)
+        : []
+    )),
     ...(openResumeThreads.threadIds ?? []),
   ].filter((threadId) => typeof threadId === "string" && threadId.length > 0));
   const automationNames = new Set(
