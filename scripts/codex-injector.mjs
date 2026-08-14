@@ -2,7 +2,8 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -100,6 +101,11 @@ let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
 const taskResumeRetryDelays = [1, 5, 30];
+const taskResumeRolloutTailBytes = 1_048_576;
+const taskResumeRolloutRoots = [
+  path.join(homedir(), ".codex", "sessions"),
+  path.join(homedir(), ".codex", "archived_sessions"),
+];
 let taskResumeWorkerTimer = null;
 let taskResumeWorkerRunning = false;
 let lastTaskboardAutomationCleanupAt = 0;
@@ -1124,6 +1130,95 @@ function buildTaskResumePrompt(task, request) {
   return `e-taskboard 任务 ${task.identifier} 已被用户退回待办。请读取最新议题和全部评论；仅当任务仍为 todo 且绑定当前会话时，使用最新 version 认领为 in_progress，然后按最新评论继续处理。续跑请求：${request.id}。`;
 }
 
+function isPathWithinDirectory(filePath, directory) {
+  const relativePath = path.relative(directory, filePath);
+  return relativePath === "" || (
+    relativePath !== ".."
+    && !relativePath.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relativePath)
+  );
+}
+
+function normalizeTaskResumeSandboxPolicy(policy) {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return null;
+  if (policy.type === "danger-full-access" || policy.type === "dangerFullAccess") {
+    return { type: "dangerFullAccess" };
+  }
+  if (policy.type === "read-only" || policy.type === "readOnly") {
+    return {
+      type: "readOnly",
+      networkAccess: typeof (policy.network_access ?? policy.networkAccess) === "boolean"
+        ? (policy.network_access ?? policy.networkAccess)
+        : false,
+    };
+  }
+  if (policy.type !== "workspace-write" && policy.type !== "workspaceWrite") return null;
+
+  const sandboxPolicy = {
+    type: "workspaceWrite",
+    writableRoots: [],
+    networkAccess: false,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  };
+  const writableRoots = policy.writable_roots ?? policy.writableRoots;
+  const networkAccess = policy.network_access ?? policy.networkAccess;
+  const excludeTmpdirEnvVar = policy.exclude_tmpdir_env_var ?? policy.excludeTmpdirEnvVar;
+  const excludeSlashTmp = policy.exclude_slash_tmp ?? policy.excludeSlashTmp;
+  if (Array.isArray(writableRoots)) {
+    sandboxPolicy.writableRoots = writableRoots.filter(
+      (root) => typeof root === "string" && path.isAbsolute(root),
+    );
+  }
+  if (typeof networkAccess === "boolean") sandboxPolicy.networkAccess = networkAccess;
+  if (typeof excludeTmpdirEnvVar === "boolean") sandboxPolicy.excludeTmpdirEnvVar = excludeTmpdirEnvVar;
+  if (typeof excludeSlashTmp === "boolean") sandboxPolicy.excludeSlashTmp = excludeSlashTmp;
+  return sandboxPolicy;
+}
+
+async function readTaskResumeSandboxPolicy(thread) {
+  const threadPolicy = normalizeTaskResumeSandboxPolicy(
+    thread?.sandboxPolicy ?? thread?.sandbox_policy,
+  );
+  if (threadPolicy) return threadPolicy;
+
+  const rolloutPath = typeof thread?.path === "string" ? thread.path : "";
+  if (!rolloutPath.endsWith(".jsonl")) return null;
+  const allowedRoot = taskResumeRolloutRoots.find((root) => (
+    isPathWithinDirectory(path.resolve(rolloutPath), root)
+  ));
+  if (!allowedRoot) return null;
+
+  try {
+    const [resolvedRoot, resolvedPath] = await Promise.all([
+      realpath(allowedRoot),
+      realpath(rolloutPath),
+    ]);
+    if (!isPathWithinDirectory(resolvedPath, resolvedRoot)) return null;
+    const rolloutStat = await stat(resolvedPath);
+    if (!rolloutStat.isFile() || rolloutStat.size === 0) return null;
+
+    const bytesToRead = Math.min(rolloutStat.size, taskResumeRolloutTailBytes);
+    const buffer = Buffer.alloc(bytesToRead);
+    const handle = await open(resolvedPath, "r");
+    try {
+      await handle.read(buffer, 0, bytesToRead, rolloutStat.size - bytesToRead);
+    } finally {
+      await handle.close();
+    }
+    const lines = buffer.toString("utf8").split("\n");
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      try {
+        const event = JSON.parse(lines[index]);
+        if (event?.type !== "turn_context") continue;
+        const policy = normalizeTaskResumeSandboxPolicy(event.payload?.sandbox_policy);
+        if (policy) return policy;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 function taskResumeRequestMatchesTask(task, request) {
   return task?.status === "todo"
     && task.archivedAt == null
@@ -1272,10 +1367,12 @@ async function deliverTaskResumeRequest(cdp, claim) {
     return;
   }
 
+  const sandboxPolicy = await readTaskResumeSandboxPolicy(thread);
   const result = await requestCodexAppServerViaCdp(cdp, undefined, "turn/start", {
     threadId: request.threadId,
     clientUserMessageId: request.id,
     input: [{ type: "text", text: buildTaskResumePrompt(claim.task, request), text_elements: [] }],
+    ...(sandboxPolicy ? { sandboxPolicy } : {}),
   });
   const turnId = result?.turn?.id;
   if (!turnId) throw taskResumeTransientError("Original thread did not return a turn ID");
