@@ -103,6 +103,8 @@ const taskConversationAppServerTimeoutMs = 30_000;
 const taskResumeRetryDelays = [1, 5, 30];
 const taskResumeTurnListLimit = 100;
 const taskResumeTurnListMaxPages = 100;
+const taskResumeTurnListTimeoutMs = 5_000;
+const taskResumeTurnListDeadlineMs = 45_000;
 const taskResumeTurnVisibilityGraceMs = 10_000;
 const taskResumeRolloutChunkBytes = 65_536;
 const taskResumeRolloutMaxLineBytes = 1_048_576;
@@ -1452,6 +1454,7 @@ async function deliverTaskResumeRequest(cdp, claim) {
 
 async function observeTaskResumeTurn(cdp, claim) {
   const { request } = claim;
+  const turnListDeadline = Date.now() + taskResumeTurnListDeadlineMs;
   let task = await readTaskResumeTask(request);
   if (taskResumeRequestAcknowledged(task, request)) return;
   if (!taskResumeRequestMatchesTask(task, request)) {
@@ -1462,14 +1465,23 @@ async function observeTaskResumeTurn(cdp, claim) {
   let cursor;
   let turn = null;
   let turnsExhausted = false;
+  let turnListTimedOut = false;
   for (let page = 0; page < taskResumeTurnListMaxPages; page += 1) {
+    if (Date.now() + taskResumeTurnListTimeoutMs > turnListDeadline) {
+      turnListTimedOut = true;
+      break;
+    }
     const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/turns/list", {
       threadId: request.threadId,
       limit: taskResumeTurnListLimit,
       sortDirection: "desc",
       itemsView: "summary",
       ...(cursor ? { cursor } : {}),
-    });
+    }, taskResumeTurnListTimeoutMs);
+    if (Date.now() >= turnListDeadline) {
+      turnListTimedOut = true;
+      break;
+    }
     turn = Array.isArray(result?.data)
       ? result.data.find((candidate) => candidate?.id === request.turnId)
       : null;
@@ -1484,14 +1496,20 @@ async function observeTaskResumeTurn(cdp, claim) {
   }
   if (!turn) {
     const dispatchedAt = Date.parse(request.dispatchedAt ?? "");
-    if (Number.isFinite(dispatchedAt) && Date.now() - dispatchedAt < taskResumeTurnVisibilityGraceMs) {
+    if (
+      !turnListTimedOut
+      && Number.isFinite(dispatchedAt)
+      && Date.now() - dispatchedAt < taskResumeTurnVisibilityGraceMs
+    ) {
       await deferTaskResumeRequest(claim, "Original thread turn is not visible yet");
       return;
     }
     await failTaskResumeRequest(
       claim,
       taskResumePermanentError(
-        turnsExhausted
+        turnListTimedOut
+          ? "Original thread history scan timed out"
+          : turnsExhausted
           ? "Original thread turn is not visible"
           : "Original thread turn exceeded the observation page limit",
       ),
