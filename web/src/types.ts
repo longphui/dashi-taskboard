@@ -172,6 +172,17 @@ export interface WorkflowWorkspaceRecord<T = unknown> {
   updatedAt: string | null;
 }
 
+export interface CodexProjectIdentity {
+  codexProjectId: string;
+  codexProjectKind: "local" | "remote";
+  codexHostId: string;
+  workspacePath: string;
+}
+
+export interface CodexThreadBinding extends CodexProjectIdentity {
+  threadId: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -211,13 +222,17 @@ export interface TaskRelations {
   related: TaskRelationSummary[];
 }
 
-export interface TaskConversationRef {
-  threadId: string;
+interface TaskConversationRefBase {
   source: "task" | "comment";
   sourceId: string;
   title: string;
   updatedAt: string;
 }
+
+export type TaskConversationRef = TaskConversationRefBase & (
+  | (CodexThreadBinding & { legacyLocal?: false })
+  | { threadId: string; legacyLocal: true }
+);
 
 export interface Task {
   id: string;
@@ -230,6 +245,8 @@ export interface Task {
   labels: string[];
   sortOrder: number;
   threadId: string | null;
+  threadBinding: CodexThreadBinding | null;
+  legacyLocalThreadId: string | null;
   conversationRefs: TaskConversationRef[];
   participants: ActorIdentity[];
   previewImage: Attachment | null;
@@ -276,6 +293,8 @@ export interface Comment {
   authorName: string;
   authorAvatarUrl: string | null;
   threadId: string | null;
+  threadBinding: CodexThreadBinding | null;
+  legacyLocalThreadId: string | null;
   attachments: Attachment[];
   version: number;
   createdAt: string;
@@ -316,7 +335,13 @@ export interface HostContext {
   threadId?: string;
   theme?: "light" | "dark";
   projectId?: string;
-  projects?: Array<{ id: string; name: string }>;
+  projects?: Array<{
+    id: string;
+    name: string;
+    projectKind?: "local" | "remote";
+    workspacePath?: string;
+    hostId?: string;
+  }>;
   titlebarLeftInset?: number;
   sidebarCollapsed?: boolean;
   threadRunning?: boolean;

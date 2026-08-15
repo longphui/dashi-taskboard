@@ -171,4 +171,8 @@ npm run codex:inject -- --port 9229 --open
 npm run check
 ```
 
-该命令会运行 TypeScript 检查、生产前端构建，以及服务器/CLI/注入测试套件。
+该命令会运行 TypeScript 检查、生产前端构建、组件测试，以及服务器/CLI/注入测试套件。
+
+## 议题 Markdown
+
+议题描述和评论支持 GFM，包括表格和任务列表。`mermaid` 围栏代码块会在查看器加载后渲染成只读图；渲染失败时仍可阅读原始图表源码。Markdown HTML 注释（例如 `<!-- trace-analysis:v1 ... -->`）不会出现在渲染后的正文中，且不会启用原始 HTML。

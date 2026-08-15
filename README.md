@@ -175,4 +175,8 @@ See [Cloud collaboration](docs/cloud-collaboration.md) for owner deployment, exi
 npm run check
 ```
 
-This runs TypeScript checking, a production frontend build, and the server/CLI/injection test suite.
+This runs TypeScript checking, a production frontend build, the component tests, and the server/CLI/injection test suite.
+
+## Task Markdown
+
+Task descriptions and comments support GFM, including tables and task lists. Fenced `mermaid` blocks are rendered as read-only diagrams after the viewer loads; the diagram source remains available when rendering fails. Markdown HTML comments, such as `<!-- trace-analysis:v1 ... -->`, are hidden from the rendered document. Raw HTML is not enabled.

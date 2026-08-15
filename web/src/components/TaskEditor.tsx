@@ -206,6 +206,11 @@ export function TaskEditor({
   const selectedSubIssues = subIssueIds
     .map((id) => taskById.get(id))
     .filter((candidate): candidate is Task => candidate !== undefined);
+  const selectedRelationChips = [
+    ...selectedSubIssues.map((issue) => ({ type: "subIssue" as const, issue })),
+    ...(selectedParent ? [{ type: "parent" as const, issue: selectedParent }] : []),
+    ...selectedRelated.map((issue) => ({ type: "related" as const, issue })),
+  ];
   const selectedParentAncestorIds = useMemo(() => {
     const ids = new Set<string>();
     let currentId = parentId;
@@ -632,6 +637,30 @@ export function TaskEditor({
                 )}</span>
               </button>
             )}
+
+            {!task && selectedRelationChips.map(({ type, issue }) => {
+              const identifier = issue.externalKey ?? issue.identifier;
+              return (
+                <span className="property-control property-relation-chip" key={`${type}:${issue.id}`}>
+                  <span>{identifier}</span>
+                  <button
+                    className="property-relation-remove"
+                    type="button"
+                    aria-label={text(`移除 ${identifier}`, `Remove ${identifier}`)}
+                    onClick={() => {
+                      if (type === "parent") setParentId(null);
+                      else if (type === "related") {
+                        setRelatedIds((current) => current.filter((id) => id !== issue.id));
+                      } else {
+                        setSubIssueIds((current) => current.filter((id) => id !== issue.id));
+                      }
+                    }}
+                  >
+                    <LinearIcon name="close" />
+                  </button>
+                </span>
+              );
+            })}
 
             <div className="composer-menu-anchor" ref={moreMenuRef}>
               <button className="property-control property-more" type="button" aria-label={text("更多属性", "More properties")} onClick={() => { setRelationMenu(null); setMenu(menu === "more" ? null : "more"); }}><LinearIcon name="more" /></button>

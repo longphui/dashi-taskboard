@@ -37,7 +37,7 @@ test("embedded page uses the launcher URL inside an opaque sandbox", () => {
 
 test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
   assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins"\]/);
-  assert.match(source, /if \(siblings\.length >= 3\) return plugin;/);
+  assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
   assert.match(source, /return directButtons\.length >= 3/);
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
   assert.match(source, /reference\.after\(entry\)/);
@@ -187,13 +187,17 @@ test("the iframe automation contract is forwarded through the fixed host binding
   assert.match(source, /operation: payload\.operation/);
   assert.match(source, /taskboardProjectId: payload\.taskboardProjectId/);
   assert.match(source, /codexProjectId: payload\.codexProjectId/);
+  assert.match(source, /codexProjectKind: payload\.codexProjectKind/);
+  assert.match(source, /codexHostId: payload\.codexHostId/);
   assert.match(source, /workspacePath: payload\.workspacePath/);
+  assert.match(source, /remoteProjects: payload\.remoteProjects/);
   assert.match(source, /skillPath: payload\.skillPath/);
   assert.match(source, /model: payload\.model/);
   assert.match(source, /reasoningEffort: payload\.reasoningEffort/);
   assert.match(source, /type: "taskboard:automation-response"/);
   assert.match(source, /requestId,\s*ok: true,\s*item: response\.item/);
   assert.match(source, /items: response\.items/);
+  assert.match(source, /policy: response\.policy/);
   assert.match(source, /requestId,\s*ok: false,\s*error:/);
   assert.match(source, /type: HOST_REQUEST_MESSAGE/);
   assert.match(source, /capability: HOST_CAPABILITY/);
@@ -212,8 +216,11 @@ test("complete App automation payloads cross the injected forwarder into the cur
     requestId: "request-1",
     taskboardProjectId: "local",
     codexProjectId: "codex-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
     projectName: "Local",
     workspacePath: "/tmp/local-project",
+    remoteProjects: [],
     skillPath: "/tmp/manage-taskboard/SKILL.md",
     automationId: "automation-1",
     enabledByUser: true,
@@ -248,7 +255,11 @@ test("only a loopback Taskboard iframe can request native automation", () => {
   );
 });
 
-test("issues start a native Codex conversation in the confirmed workspace with the task title", () => {
+test("issues start a native Codex conversation in the confirmed project with the task title", () => {
+  const createThreadSource = source.slice(
+    source.indexOf("async function createThreadForTask"),
+    source.indexOf("async function handleAutomationRequest"),
+  );
   assert.match(source, /async function createThreadForTask\(payload\)/);
   assert.match(source, /async function nativeProjectContext\(\)/);
   assert.match(source, /async function activeNativeWorkspaceRoots\(\)/);
@@ -265,37 +276,44 @@ test("issues start a native Codex conversation in the confirmed workspace with t
   assert.match(waitSource, /projectId\s*&&\s*normalizeNativeRootPath\(activeRoots\[0\]\) === normalizedTargetRoot/);
   assert.match(
     source,
-    /requestNativeFetch\("add-workspace-root-option", \{\s*root: target\.targetRoot,\s*setActive: true,\s*origin: window\.location\.origin,/,
+    /requestNativeFetch\("add-workspace-root-option", \{\s*root: targetRoot,\s*setActive: true,\s*origin: window\.location\.origin,/,
   );
   assert.match(source, /if \(switched\?\.success !== true\)/);
-  assert.match(source, /await waitForNativeProject\(target\.targetRoot\)/);
+  assert.match(source, /await waitForNativeProject\(targetRoot\)/);
+  assert.match(
+    createThreadSource,
+    /if \(codexProjectKind === "remote"\) \{[\s\S]*?codexHostId = typeof payload\?\.codexHostId[\s\S]*?codexProjectWorkspacePath[\s\S]*?await waitForRemoteProject\(requestedProjectId, codexHostId, codexProjectWorkspacePath\);\s*targetRoot = codexProjectWorkspacePath;/,
+  );
   assert.match(source, /const previousThreadId = normalizeThreadId/);
   assert.match(source, /const focusComposerNonce = crypto\.randomUUID\(\)/);
   assert.match(source, /state: \{\s*focusComposerNonce,\s*prefillPrompt: instruction,/);
   assert.match(source, /const HOST_REQUEST_TIMEOUT_MS = 12_000/);
+  assert.match(source, /const TASK_CONVERSATION_REQUEST_TIMEOUT_MS = 75_000/);
   assert.match(source, /function requestHost\(action, payload = \{\}, timeoutMs = HOST_REQUEST_TIMEOUT_MS\)/);
-  assert.doesNotMatch(source, /CONVERSATION_REQUEST_TIMEOUT_MS/);
-  assert.match(source, /requestHostTaskConversationStart\(\{\s*taskId,\s*previousThreadId,\s*targetRoot: target\.targetRoot,\s*instruction,\s*title,/);
+  assert.match(source, /requestHostTaskConversationStart\(\{\s*taskId,\s*previousThreadId,\s*codexHostId,\s*targetRoot,\s*instruction,\s*title,/);
   assert.match(
     source,
-    /requestHost\("start-task-conversation", \{\s*taskId,\s*previousThreadId,\s*targetRoot,\s*instruction,\s*title,\s*\}, null\)/,
+    /requestHost\("start-task-conversation", \{\s*taskId,\s*previousThreadId,\s*codexHostId,\s*targetRoot,\s*instruction,\s*title,\s*\}, TASK_CONVERSATION_REQUEST_TIMEOUT_MS\)/,
   );
   assert.match(source, /lastNativeThreadId = startedThreadId/);
   assert.match(source, /type: "taskboard:thread-prepared", payload: \{ taskId, threadId: started\.threadId \}/);
-  assert.match(
-    webApp,
-    /const instruction = `e-taskboard 处理任务面板任务 \$\{task\.identifier\}，并同步进度状态。`/,
-  );
-  assert.doesNotMatch(webApp, /const prompt =/);
-  assert.doesNotMatch(webApp, /skillName: "manage-taskboard"/);
-  assert.match(webApp, /instruction,/);
+  assert.match(webApp, /Promise\.all\(\[getTask\(task\.id\), listComments\(task\.id\)\]\)/);
+  assert.match(webApp, /moveTaskRequest\(latestTask, "in_progress", undefined, null\)/);
+  assert.match(webApp, /pendingRemoteThreadClaimsRef\.current\.set/);
+  assert.match(webApp, /完整描述[\s\S]*全部评论[\s\S]*开发上下文/);
+  assert.match(webApp, /远程 worker 不得运行 taskctl/);
   assert.match(webApp, /title: task\.title,/);
   assert.match(webApp, /type: "taskboard:create-thread"/);
-  assert.match(webApp, /type: "taskboard:open-thread", payload: \{ threadId \}/);
+  assert.match(webApp, /codexProjectWorkspacePath: identity\.workspacePath/);
+  assert.match(webApp, /workspacePath: identity\.workspacePath/);
+  assert.match(webApp, /const binding: CodexThreadBinding = \{ threadId, \.\.\.pending\.identity \}/);
+  assert.match(webApp, /moveTaskRequest\([\s\S]*pending\.claimedTask,[\s\S]*"in_progress",[\s\S]*binding/);
+  assert.match(webApp, /pending\.previousTask\.status[\s\S]*binding/);
+  assert.match(webApp, /type: "taskboard:open-thread",[\s\S]*?payload: binding/);
 });
 
 test("the standalone web page opens linked Codex tasks through the app deep link", () => {
-  assert.match(webApp, /window\.location\.assign\(`codex:\/\/threads\/\$\{encodeURIComponent\(threadId\.trim\(\)\)\}`\)/);
+  assert.match(webApp, /window\.location\.assign\(`codex:\/\/threads\/\$\{encodeURIComponent\(binding\.threadId\.trim\(\)\)\}`\)/);
 });
 
 test("the injected app opens an existing local Codex task instead of a new composer", () => {
@@ -309,6 +327,38 @@ test("the injected app opens an existing local Codex task instead of a new compo
   assert.match(source, /return `\/local\/\$\{encodeURIComponent\(threadId\)\}`/);
   assert.doesNotMatch(source, /return `\/thread\/\$\{encodeURIComponent\(threadId\)\}`/);
   assert.doesNotMatch(openThreadSource, /focusComposerNonce/);
+  assert.match(webApp, /payload: \{ threadId, legacyLocal: true \}/);
+  assert.doesNotMatch(webApp, /payload: \{ threadId, legacyLocal: true, [^}]*codexProject/);
+});
+
+test("remote Codex tasks wait for the exact project and host without a local route fallback", () => {
+  const remoteProjectSource = source.slice(
+    source.indexOf("async function waitForRemoteProject"),
+    source.indexOf("async function waitForRemoteThreadRow"),
+  );
+  const openThreadSource = source.slice(
+    source.indexOf("async function openThread"),
+    source.indexOf("async function nativeProjectContext"),
+  );
+  const remoteOpenSource = openThreadSource.slice(
+    openThreadSource.indexOf("if (remoteProject)"),
+    openThreadSource.indexOf("\n    lastNativeThreadId = normalizedThreadId;"),
+  );
+  assert.match(remoteProjectSource, /if \(!projectId \|\| !hostId \|\| hostId === "local"\)/);
+  assert.match(remoteProjectSource, /row = projectRowById\(projectId\)/);
+  assert.match(remoteProjectSource, /selectedNativeProjectId\(\)/);
+  assert.match(remoteProjectSource, /readCodexProjectMetadata\(\)/);
+  assert.match(remoteProjectSource, /selectedProjectId === projectId/);
+  assert.match(remoteProjectSource, /selectedProject\?\.projectKind === "remote"/);
+  assert.match(remoteProjectSource, /selectedProject\.hostId === hostId/);
+  assert.match(remoteProjectSource, /!workspacePath \|\| selectedProject\.workspacePath === workspacePath/);
+  assert.match(remoteOpenSource, /waitForRemoteThreadRow\(normalizedThreadId, projectId\)/);
+  assert.match(remoteOpenSource, /type: "taskboard:thread-open-error"/);
+  assert.doesNotMatch(remoteOpenSource, /routeForThread/);
+  assert.match(webApp, /openThread\(conversation\.threadBinding\)/);
+  assert.match(webApp, /onOpenThread=\{openThread\}/);
+  assert.match(webApp, /project\.id === binding\.codexProjectId[\s\S]*?project\.hostId === binding\.codexHostId[\s\S]*?project\.workspacePath === binding\.workspacePath/);
+  assert.match(webApp, /message\.type === "taskboard:thread-open-error"/);
 });
 
 test("host navigation follows Codex's renderer message bus", () => {
@@ -330,7 +380,13 @@ test("the standalone web page reports that new Codex conversations require the e
 });
 
 test("host context captures all Codex projects even when the sidebar section is collapsed", () => {
-  assert.match(source, /function readCodexProjects\(\)/);
+  assert.match(source, /async function readCodexProjectMetadata\(\)/);
+  assert.match(source, /await window\.electronBridge\?\.getInitialSidebarBootstrap\?\.\(\)/);
+  assert.match(source, /entries\.get\("local-projects"\)/);
+  assert.match(source, /entries\.get\("remote-projects"\)/);
+  assert.match(source, /projectKind: "remote"/);
+  assert.match(source, /workspacePath,[\s\S]*?hostId/);
+  assert.match(source, /function readCodexProjects\(metadata = codexProjectMetadata\)/);
   assert.match(source, /\[data-app-action-sidebar-project-row\]/);
   assert.match(source, /data-app-action-sidebar-project-id/);
   assert.match(source, /function findProjectsSection\(\)/);
@@ -344,6 +400,59 @@ test("host context captures all Codex projects even when the sidebar section is 
   assert.match(source, /const threadId = currentThreadId \|\| lastNativeThreadId \|\| normalizeThreadId\(threadIdFromLocation\(\)\)/);
   assert.match(source, /replace\(\/\^\(\?:local\|cloud\):\/i, ""\)/);
   assert.match(source, /function findTasksSection\(\)/);
+});
+
+test("Codex bootstrap metadata resolves local roots and SSH remote roots asynchronously", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function readCodexProjectMetadata"),
+    source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
+  );
+  const readCodexProjectMetadata = vm.runInNewContext(`(${functionSource})`, {
+    window: {
+      electronBridge: {
+        getInitialSidebarBootstrap: async () => ({
+          globalStateEntries: [
+            {
+              key: "local-projects",
+              value: {
+                local: { rootPaths: ["/Users/example/project"] },
+              },
+            },
+            {
+              key: "remote-projects",
+              value: [{
+                id: "remote-project",
+                hostId: "remote-ssh-discovered:example",
+                remotePath: "/srv/example/project",
+              }],
+            },
+          ],
+        }),
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify([...(await readCodexProjectMetadata()).entries()])),
+    [
+      ["local", {
+        projectKind: "local",
+        hostId: "local",
+        workspacePath: "/Users/example/project",
+      }],
+      ["remote-project", {
+        projectKind: "remote",
+        workspacePath: "/srv/example/project",
+        hostId: "remote-ssh-discovered:example",
+      }],
+    ],
+  );
+});
+
+test("SSH task project selection uses its stable ID and local project IDs use bootstrap keys", () => {
+  assert.match(source, /row = projectRowById\(projectId\)/);
+  assert.doesNotMatch(source, /projectRowForTask|projectRowByLabel/);
+  assert.match(source, /Object\.entries\(localProjects\)/);
+  assert.match(source, /\[\{ \.\.\.project, id \}\]/);
 });
 
 test("cleanup removes observers, listeners, timers and owned DOM", () => {

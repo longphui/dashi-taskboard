@@ -249,6 +249,54 @@ function parseThreadId(value) {
   return stringField(value, "threadId", { required: true, maxLength: 256 });
 }
 
+function parseThreadBinding(value) {
+  if (value === undefined || value === null) return value;
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "threadId",
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
+  ]));
+  const threadId = stringField(value.threadId, "threadBinding.threadId", {
+    required: true,
+    maxLength: 256,
+  });
+  const identityFields = [
+    value.codexProjectId,
+    value.codexProjectKind,
+    value.codexHostId,
+    value.workspacePath,
+  ];
+  if (identityFields.every((field) => field === undefined)) return { threadId };
+  if (identityFields.some((field) => field === undefined)) {
+    throw new ApiError(400, "INVALID_FIELD", "Thread identity must include project, kind, host, and workspace");
+  }
+  const codexProjectId = stringField(value.codexProjectId, "threadBinding.codexProjectId", {
+    required: true,
+    maxLength: 256,
+  });
+  const codexProjectKind = value.codexProjectKind;
+  const codexHostId = stringField(value.codexHostId, "threadBinding.codexHostId", {
+    required: true,
+    maxLength: 256,
+  });
+  const workspacePath = stringField(value.workspacePath, "threadBinding.workspacePath", {
+    required: true,
+    maxLength: 4096,
+  });
+  if (
+    (codexProjectKind !== "local" && codexProjectKind !== "remote")
+    || (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")
+    || workspacePath.includes("\0")
+  ) {
+    throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
+  }
+  return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
 function parseWorkflowId(value) {
   const workflowId = stringField(value, "workflowId", {
     nullable: true,
@@ -500,6 +548,47 @@ function commentConversationTitle(body) {
   return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
 }
 
+function threadBindingFromRow(row) {
+  if (
+    !row.thread_id
+    || !row.thread_codex_project_id
+    || !row.thread_codex_project_kind
+    || !row.thread_codex_host_id
+    || !row.thread_workspace_path
+  ) return null;
+  return {
+    threadId: row.thread_id,
+    codexProjectId: row.thread_codex_project_id,
+    codexProjectKind: row.thread_codex_project_kind,
+    codexHostId: row.thread_codex_host_id,
+    workspacePath: row.thread_workspace_path,
+  };
+}
+
+function legacyLocalThreadIdFromRow(row) {
+  if (!row.thread_id) return null;
+  return [
+    row.thread_codex_project_id,
+    row.thread_codex_project_kind,
+    row.thread_codex_host_id,
+    row.thread_workspace_path,
+  ].every((value) => value == null)
+    ? row.thread_id
+    : null;
+}
+
+function storedThreadBinding(threadBinding, threadId) {
+  if (threadBinding === undefined && (threadId === undefined || threadId === null)) return undefined;
+  const binding = threadBinding === undefined ? { threadId } : threadBinding;
+  return [
+    binding?.threadId ?? null,
+    binding?.codexProjectId ?? null,
+    binding?.codexProjectKind ?? null,
+    binding?.codexHostId ?? null,
+    binding?.workspacePath ?? null,
+  ];
+}
+
 function attachTaskActivity(task, comments, activities, previewImage = null) {
   const orderedComments = [...comments].sort((left, right) => left.id.localeCompare(right.id));
   const orderedActivities = [...activities].sort((left, right) => left.id.localeCompare(right.id));
@@ -535,9 +624,18 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
     });
   }
   const conversationRefs = [];
-  if (task.threadId) {
+  if (task.threadBinding) {
     conversationRefs.push({
-      threadId: task.threadId,
+      ...task.threadBinding,
+      source: "task",
+      sourceId: task.id,
+      title: task.title,
+      updatedAt: task.updatedAt,
+    });
+  } else if (task.legacyLocalThreadId) {
+    conversationRefs.push({
+      threadId: task.legacyLocalThreadId,
+      legacyLocal: true,
       source: "task",
       sourceId: task.id,
       title: task.title,
@@ -545,14 +643,17 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
     });
   }
   for (const comment of orderedComments) {
-    if (!comment.thread_id) continue;
-    conversationRefs.push({
-      threadId: comment.thread_id,
-      source: "comment",
-      sourceId: comment.id,
-      title: commentConversationTitle(comment.body),
-      updatedAt: comment.updated_at,
-    });
+    const threadBinding = threadBindingFromRow(comment);
+    const legacyLocalThreadId = legacyLocalThreadIdFromRow(comment);
+    if (threadBinding || legacyLocalThreadId) {
+      conversationRefs.push({
+        ...(threadBinding ?? { threadId: legacyLocalThreadId, legacyLocal: true }),
+        source: "comment",
+        sourceId: comment.id,
+        title: commentConversationTitle(comment.body),
+        updatedAt: comment.updated_at,
+      });
+    }
   }
   task.conversationRefs = conversationRefs;
   task.participants = participants;
@@ -615,6 +716,8 @@ function taskFromRow(row) {
     labels: JSON.parse(row.labels),
     sortOrder: row.sort_order,
     threadId: row.thread_id,
+    threadBinding: threadBindingFromRow(row),
+    legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
     creatorType: row.creator_type,
     creatorId: row.creator_id,
     creatorName: row.creator_name,
@@ -663,6 +766,8 @@ function commentFromRow(row, attachments = []) {
     taskId: row.task_id,
     body: row.body,
     threadId: row.thread_id,
+    threadBinding: threadBindingFromRow(row),
+    legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
     authorType: row.author_type,
     authorId: row.author_id,
     authorName: row.author_name,
@@ -834,7 +939,9 @@ async function hydrateTask(env, row, activityComments = null, activityChanges = 
     SELECT
       id, task_id,
       CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
-      thread_id, author_type, author_id, author_name,
+      thread_id, thread_codex_project_id, thread_codex_project_kind,
+      thread_codex_host_id, thread_workspace_path,
+      author_type, author_id, author_name,
       author_avatar_url, version, updated_at
     FROM comments
     WHERE task_id = ?
@@ -871,7 +978,9 @@ async function taskActivityComments(env, taskIds) {
       SELECT
         id, task_id,
         CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
-        thread_id, author_type, author_id, author_name,
+        thread_id, thread_codex_project_id, thread_codex_project_kind,
+        thread_codex_host_id, thread_workspace_path,
+        author_type, author_id, author_name,
         author_avatar_url, version, updated_at
       FROM comments
       WHERE task_id IN (${placeholders})
@@ -939,6 +1048,7 @@ function parseTaskCreate(body) {
     "labels",
     "sortOrder",
     "threadId",
+    "threadBinding",
     "assigneeTarget",
     "workflowId",
     "developmentContext",
@@ -955,6 +1065,7 @@ function parseTaskCreate(body) {
     labels: body.labels === undefined ? [] : parseLabels(body.labels),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
     assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
     workflowId: parseWorkflowId(body.workflowId ?? null),
     developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
@@ -979,6 +1090,7 @@ function parseTaskPatch(body) {
     "priority",
     "labels",
     "threadId",
+    "threadBinding",
     "assigneeTarget",
     "workflowId",
     "developmentContext",
@@ -1012,42 +1124,46 @@ function parseTaskPatch(body) {
     version: parseVersion(body.version),
     changes,
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
     assigneeTarget,
   };
 }
 
 function parseMove(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId"]));
+  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "threadBinding"]));
   return {
     version: parseVersion(body.version),
     status: parseStatus(body.status),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
 function parseVersionMutation(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "threadId"]));
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding"]));
   return {
     version: parseVersion(body.version),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
 function parseCommentCreate(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["body", "threadId"]));
+  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding"]));
   return {
     body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
 function parseCommentPatch(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "body", "threadId"]));
+  assertAllowedKeys(body, new Set(["version", "body", "threadId", "threadBinding"]));
   if (body.body === undefined) {
     throw new ApiError(400, "INVALID_FIELD", "'body' is required");
   }
@@ -1055,6 +1171,7 @@ function parseCommentPatch(body) {
     version: parseVersion(body.version),
     body: stringField(body.body, "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
@@ -1428,7 +1545,9 @@ async function createTask(env, input, actor) {
     env.DB.prepare(`
       INSERT INTO tasks (
         id, identifier, project_id, title, description, status, priority, labels,
-        sort_order, thread_id, creator_type, creator_id, creator_name, creator_avatar_url,
+        sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
+        thread_codex_host_id, thread_workspace_path,
+        creator_type, creator_id, creator_name, creator_avatar_url,
         assignee_type, assignee_id, assignee_name, assignee_avatar_url,
         workflow_id, development_context_type, development_branch,
         start_date, due_date, recurrence_interval, recurrence_unit,
@@ -1445,8 +1564,12 @@ async function createTask(env, input, actor) {
           ), 1)
         ) AS TEXT),
         projects.id,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?, ?,
         NULL, 1, ?, ?
       FROM projects
       WHERE projects.id = ?
@@ -1461,7 +1584,7 @@ async function createTask(env, input, actor) {
       input.priority,
       JSON.stringify(input.labels),
       sortOrder,
-      input.threadId ?? null,
+      ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
       actor.type,
       actor.id,
       actor.name,
@@ -1620,9 +1743,16 @@ async function updateTask(env, id, input, actor) {
     );
     values.push(assignee.type, assignee.id, assignee.name, assignee.avatarUrl);
   }
-  if (input.threadId !== undefined && !Object.hasOwn(input.changes, "projectId")) {
-    assignments.push("thread_id = ?");
-    values.push(input.threadId);
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  if (storedBinding && !Object.hasOwn(input.changes, "projectId")) {
+    assignments.push(
+      "thread_id = ?",
+      "thread_codex_project_id = ?",
+      "thread_codex_project_kind = ?",
+      "thread_codex_host_id = ?",
+      "thread_workspace_path = ?",
+    );
+    values.push(...storedBinding);
   }
   assignments.push("version = version + 1", "updated_at = ?");
   const timestamp = now();
@@ -1768,19 +1898,24 @@ async function moveTask(env, id, input, actor) {
     sortOrder = row.maximum + 1000;
   }
   const timestamp = now();
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
   const statements = [env.DB.prepare(`
     UPDATE tasks
     SET
       status = ?,
       sort_order = ?,
-      thread_id = COALESCE(?, thread_id),
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
   `).bind(
     input.status,
     sortOrder,
-    input.threadId ?? null,
+    ...(storedBinding ?? []),
     timestamp,
     current.id,
     input.version,
@@ -1813,15 +1948,20 @@ async function archiveTask(env, id, input, actor) {
   const current = await requireTaskRow(env, id);
   assertTaskVersion(current, input.version);
   const timestamp = now();
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
   const results = await env.DB.batch([env.DB.prepare(`
     UPDATE tasks
     SET
       archived_at = ?,
-      thread_id = COALESCE(?, thread_id),
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
-  `).bind(timestamp, input.threadId ?? null, timestamp, current.id, input.version),
+  `).bind(timestamp, ...(storedBinding ?? []), timestamp, current.id, input.version),
   taskActivityStatement(
     env,
     current.id,
@@ -1849,15 +1989,20 @@ async function restoreTask(env, id, input, actor) {
     throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
   }
   const timestamp = now();
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
   const results = await env.DB.batch([env.DB.prepare(`
     UPDATE tasks
     SET
       archived_at = NULL,
-      thread_id = COALESCE(?, thread_id),
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
-  `).bind(input.threadId ?? null, timestamp, current.id, input.version),
+  `).bind(...(storedBinding ?? []), timestamp, current.id, input.version),
   taskActivityStatement(
     env,
     current.id,
@@ -1959,6 +2104,11 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
   );
   const endpoints = relationEndpoints(type, task.id, relatedTask.id);
   const timestamp = now();
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
   let previousRelation = null;
   const statements = [];
   if (endpoints.relationType === "parent") {
@@ -2034,11 +2184,11 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
     env.DB.prepare(`
       UPDATE tasks
       SET
-        thread_id = COALESCE(?, thread_id),
+        ${threadAssignment}
         version = version + 1,
         updated_at = ?
       WHERE id = ? AND version = ?
-    `).bind(input.threadId ?? null, timestamp, task.id, input.version),
+    `).bind(...(storedBinding ?? []), timestamp, task.id, input.version),
   );
   const taskUpdateIndex = statements.length - 1;
   statements.push(taskActivityStatement(
@@ -2112,6 +2262,11 @@ async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
     throw new ApiError(404, "RELATION_NOT_FOUND", "This issue relation does not exist");
   }
   const timestamp = now();
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
   const results = await env.DB.batch([
     env.DB.prepare(`
       DELETE FROM task_relations
@@ -2131,11 +2286,11 @@ async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
     env.DB.prepare(`
       UPDATE tasks
       SET
-        thread_id = COALESCE(?, thread_id),
+        ${threadAssignment}
         version = version + 1,
         updated_at = ?
       WHERE id = ? AND version = ?
-    `).bind(input.threadId ?? null, timestamp, task.id, input.version),
+    `).bind(...(storedBinding ?? []), timestamp, task.id, input.version),
     taskActivityStatement(
       env,
       task.id,
@@ -2268,14 +2423,15 @@ async function createComment(env, taskId, input, actor) {
   const timestamp = now();
   await env.DB.prepare(`
     INSERT INTO comments (
-      id, task_id, body, thread_id, author_type, author_id, author_name,
+      id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
+      thread_codex_host_id, thread_workspace_path, author_type, author_id, author_name,
       author_avatar_url, version, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   `).bind(
     id,
     task.id,
     input.body,
-    input.threadId ?? null,
+    ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
     actor.type,
     actor.id,
     actor.name,
@@ -2309,17 +2465,22 @@ function assertCommentVersion(row, expectedVersion) {
 async function updateComment(env, id, input) {
   const current = await requireCommentRow(env, id);
   assertCommentVersion(current, input.version);
+  const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
   const result = await env.DB.prepare(`
     UPDATE comments
     SET
       body = ?,
-      thread_id = COALESCE(?, thread_id),
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
   `).bind(
     input.body,
-    input.threadId ?? null,
+    ...(storedBinding ?? []),
     now(),
     current.id,
     input.version,

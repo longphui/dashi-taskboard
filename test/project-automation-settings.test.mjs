@@ -26,6 +26,9 @@ test("project automation state is device-local and scoped by taskboard project",
   assert.match(appSource, /type ProjectAutomationStatus = "ACTIVE" \| "PAUSED"/);
   assert.match(appSource, /automationId\?: string/);
   assert.match(appSource, /codexProjectId: string/);
+  assert.match(appSource, /codexProjectKind: "local" \| "remote"/);
+  assert.match(appSource, /codexHostId: string/);
+  assert.match(appSource, /workspacePath: string/);
   assert.match(appSource, /type AutomationIntervalMinutes = 5 \| 10 \| 15 \| 30 \| 60/);
   assert.match(appSource, /DEFAULT_AUTOMATION_OPTIONS[\s\S]*?model: "gpt-5\.5"[\s\S]*?reasoningEffort: "high"/);
   assert.match(appSource, /taskboardStorage\.getItem\(PROJECT_AUTOMATIONS_KEY\)/);
@@ -38,6 +41,8 @@ test("automation requests use the exact Codex host message contract", () => {
   assert.match(appSource, /operation: "ensure-active" \| "pause" \| "list"/);
   assert.match(appSource, /context: AutomationRequestContext[\s\S]*?taskboardProjectId: context\.taskboardProjectId/);
   assert.match(appSource, /codexProjectId/);
+  assert.match(appSource, /codexProjectKind/);
+  assert.match(appSource, /codexHostId/);
   assert.match(appSource, /projectName: selectedProject\.name/);
   assert.match(appSource, /workspacePath/);
   assert.match(appSource, /skillPath: manageTaskboardSkillPath/);
@@ -51,10 +56,45 @@ test("automation requests use the exact Codex host message contract", () => {
 });
 
 test("project mapping is based on exact ids and workspace paths, never project names", () => {
-  assert.match(appSource, /hostContext\?\.projects\?\.some\([\s\S]*?project\.id === selectedProject\.id/);
-  assert.match(appSource, /deviceWorkspacePaths\[project\.id\] === workspacePath/);
+  const automationContextSource = appSource.slice(
+    appSource.indexOf("const automationProjectContext"),
+    appSource.indexOf("const automationRequestContext"),
+  );
+  assert.match(
+    automationContextSource,
+    /const effectiveCodexProjectId = selectedProject\.id === GLOBAL_PROJECT_ID\s*\? hostContext\?\.projectId\s*: selectedProject\.id/,
+  );
+  assert.match(automationContextSource, /project\.id === effectiveCodexProjectId/);
+  assert.match(automationContextSource, /savedIdentity\?\.codexProjectKind === "remote"/);
+  assert.match(automationContextSource, /project\.id === savedIdentity\.codexProjectId/);
+  assert.match(automationContextSource, /liveProject\.hostId !== savedIdentity\.codexHostId/);
+  assert.match(automationContextSource, /liveProject\.workspacePath !== savedIdentity\.workspacePath/);
+  assert.match(appSource, /directCodexProject\?\.workspacePath/);
+  assert.match(appSource, /\(deviceWorkspacePaths\[project\.id\] \?\? project\.workspacePath\) === workspacePath/);
   assert.match(appSource, /请先在 Codex 中添加并映射该项目目录/);
   assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
+});
+
+test("global tasks resolve thread metadata from the active Codex project", () => {
+  const openTaskSource = appSource.slice(
+    appSource.indexOf("function codexProjectContextForTaskProject"),
+    appSource.indexOf("function changeProject"),
+  );
+  assert.match(
+    openTaskSource,
+    /const effectiveCodexProjectId = taskboardProjectId === GLOBAL_PROJECT_ID\s*\? hostContext\?\.projectId\s*: taskboardProjectId/,
+  );
+  assert.match(
+    openTaskSource,
+    /hostContext\?\.projects\?\.find\(\s*\(project\) => project\.id === effectiveCodexProjectId/,
+  );
+  assert.match(openTaskSource, /codexProjectId: codexProject\.id,\s*codexProjectKind: codexProject\.projectKind/);
+  assert.match(openTaskSource, /const savedRemoteIdentity = projectCodexIdentities\[task\.projectId\]/);
+  assert.match(openTaskSource, /codexProjectContextForTaskProject\(task\.projectId\)/);
+  assert.match(openTaskSource, /project\.hostId === baseIdentity\.codexHostId/);
+  assert.match(openTaskSource, /project\.workspacePath === worktreePath/);
+  assert.match(openTaskSource, /if \(matches\.length !== 1\) return null/);
+  assert.match(openTaskSource, /codexProjectId: codexProjectContext\?\.codexProjectId/);
 });
 
 test("the project navigation automation menu owns the icon, fields, and accessible popover", () => {
@@ -163,6 +203,10 @@ test("opening settings and changing projects reconcile with the host list", () =
     /sendAutomationRequest\(\s*"apply-policy",\s*queuedSave\.options,\s*queuedSave\.context,\s*previousRecord\?\.automationId,\s*\)/,
   );
   assert.match(appSource, /const policy = isAutomationHostPolicy\(response\.policy\) \? response\.policy : null/);
+  assert.match(appSource, /typeof value\.codexProjectId === "string"/);
+  assert.match(appSource, /value\.codexProjectKind === "local" \|\| value\.codexProjectKind === "remote"/);
+  assert.match(appSource, /typeof value\.codexHostId === "string"/);
+  assert.match(appSource, /typeof value\.workspacePath === "string"/);
   assert.match(appSource, /const item = \(isAutomationHostItem\(response\.item\) \? response\.item : undefined\)\s*\?\? items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
   assert.match(appSource, /items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
   assert.match(appSource, /items\.length === 1 \? items\[0\] : undefined/);
@@ -170,6 +214,16 @@ test("opening settings and changing projects reconcile with the host list", () =
   assert.match(appSource, /status: item\?\.status \?\? "PAUSED"/);
   assert.match(appSource, /enabledByUser: policy\.enabledByUser/);
   assert.match(appSource, /quotaAware: policy\.quotaAware/);
+  assert.match(drainSource, /codexProjectId: policy\.codexProjectId/);
+  assert.match(drainSource, /codexProjectKind: policy\.codexProjectKind/);
+  assert.match(drainSource, /codexHostId: policy\.codexHostId/);
+  assert.match(drainSource, /workspacePath: policy\.workspacePath/);
+  assert.doesNotMatch(drainSource, /codexProjectId: queuedSave\.context\.codexProjectId/);
+  assert.match(reconcileSource, /const effectiveProjectIdentity = policy \?\? automationRequestContext/);
+  assert.match(reconcileSource, /codexProjectId: effectiveProjectIdentity\.codexProjectId/);
+  assert.match(reconcileSource, /codexProjectKind: effectiveProjectIdentity\.codexProjectKind/);
+  assert.match(reconcileSource, /codexHostId: effectiveProjectIdentity\.codexHostId/);
+  assert.match(reconcileSource, /workspacePath: effectiveProjectIdentity\.workspacePath/);
   assert.match(appSource, /automationId: undefined,[\s\S]*?status: "PAUSED"/);
   assert.match(drainSource, /writeProjectAutomation\(queuedSave\.projectId, previousRecord\)/);
 });
