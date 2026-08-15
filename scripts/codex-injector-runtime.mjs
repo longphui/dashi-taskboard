@@ -2,7 +2,7 @@ const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后�
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 
 function parseHostRequest(payload, parseAutomationRequest) {
-  if (typeof payload !== "string" || payload.length > 16_384) {
+  if (typeof payload !== "string" || payload.length > 4_194_304) {
     return { id: null, request: null, error: HOST_REQUEST_ERROR };
   }
 
@@ -65,12 +65,16 @@ function parseHostRequest(payload, parseAutomationRequest) {
     && !/[\u0000-\u001f\u007f]/.test(request.taskId)
     && typeof request.previousThreadId === "string"
     && request.previousThreadId.length <= 240
+    && typeof request.codexHostId === "string"
+    && request.codexHostId.length > 0
+    && request.codexHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
     && typeof request.targetRoot === "string"
     && request.targetRoot.length > 0
     && request.targetRoot.length <= 4_096
     && typeof request.instruction === "string"
     && request.instruction.length > 0
-    && request.instruction.length <= 1_024
+    && request.instruction.length <= 4_000_000
     && typeof request.title === "string"
     && request.title.length > 0
     && request.title.length <= 240
@@ -125,6 +129,8 @@ export async function handleHostBindingPayload(params, handlers) {
       id: parsed.request.id,
       ok: false,
       error: error.message,
+      ...(typeof error?.threadId === "string" ? { threadId: error.threadId } : {}),
+      ...(error?.uncertain === true ? { uncertain: true } : {}),
     });
   }
   return { responded: true, accepted: true };

@@ -201,6 +201,69 @@ test("cloud proxy replaces client identity with Basic Auth and makes exactly one
   });
 });
 
+test("cloud proxy forwards local thread identity without replacing explicit binding changes", async () => {
+  const { createCloudProxy } = await importCloudProxy();
+  const upstreamBodies = [];
+  const localBinding = {
+    threadId: "controller-thread",
+    codexProjectId: "project-a",
+    codexProjectKind: "remote",
+    codexHostId: "host-a",
+    workspacePath: "/srv/shared-repository",
+  };
+  const proxy = createCloudProxy({
+    configStore: memoryConfigStore(),
+    resolveThreadBinding: (threadId) => (
+      threadId === localBinding.threadId ? localBinding : null
+    ),
+    fetch: async (_url, init) => {
+      upstreamBodies.push(JSON.parse(init.body));
+      return jsonResponse({ task: { id: "REMOTE-1" } });
+    },
+  });
+
+  await proxy.forward(new Request(
+    "http://127.0.0.1:47823/api/tasks/REMOTE-1/move",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        status: "blocked",
+        threadId: localBinding.threadId,
+        version: 3,
+      }),
+    },
+  ));
+  await proxy.forward(new Request(
+    "http://127.0.0.1:47823/api/tasks/REMOTE-1/move",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        status: "todo",
+        threadId: localBinding.threadId,
+        threadBinding: null,
+        version: 4,
+      }),
+    },
+  ));
+
+  assert.deepEqual(upstreamBodies, [
+    {
+      status: "blocked",
+      threadId: localBinding.threadId,
+      threadBinding: localBinding,
+      version: 3,
+    },
+    {
+      status: "todo",
+      threadId: localBinding.threadId,
+      threadBinding: null,
+      version: 4,
+    },
+  ]);
+});
+
 test("cloud companion blocks project moves for issue-linked local AI chats", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-chat-move-"));
   temporaryDirectories.push(directory);

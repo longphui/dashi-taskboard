@@ -1,6 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+use dispatch2::{run_on_main, MainThreadBound};
+#[cfg(target_os = "macos")]
+use objc2::{
+    define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, NSObjectProtocol},
+    sel, DefinedClass, MainThreadMarker, MainThreadOnly,
+};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSAlert, NSApplication, NSButton};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSObject, NSString};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::cell::RefCell;
 #[cfg(target_os = "macos")]
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::{
@@ -78,6 +93,156 @@ struct LauncherState {
     data_directory: PathBuf,
     log_path: PathBuf,
     pid_record_path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+struct UpdateDialogTargetIvars {
+    response: RefCell<Option<std::sync::mpsc::Sender<bool>>>,
+}
+
+#[cfg(target_os = "macos")]
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[name = "CodexTaskboardUpdateDialogTarget"]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = UpdateDialogTargetIvars]
+    struct UpdateDialogTarget;
+
+    unsafe impl NSObjectProtocol for UpdateDialogTarget {}
+
+    impl UpdateDialogTarget {
+        #[unsafe(method(acceptUpdate:))]
+        fn accept_update(&self, _sender: &AnyObject) {
+            self.respond(true);
+        }
+
+        #[unsafe(method(deferUpdate:))]
+        fn defer_update(&self, _sender: &AnyObject) {
+            self.respond(false);
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl UpdateDialogTarget {
+    fn new(mtm: MainThreadMarker, response: std::sync::mpsc::Sender<bool>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(UpdateDialogTargetIvars {
+            response: RefCell::new(Some(response)),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn respond(&self, accepted: bool) {
+        if let Some(response) = self.ivars().response.borrow_mut().take() {
+            let _ = response.send(accepted);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct NativeUpdateDialog {
+    alert: Retained<NSAlert>,
+    install_button: Retained<NSButton>,
+    defer_button: Retained<NSButton>,
+    _target: Retained<UpdateDialogTarget>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct UpdateDialog {
+    native: Arc<MainThreadBound<NativeUpdateDialog>>,
+}
+
+#[cfg(target_os = "macos")]
+impl UpdateDialog {
+    fn prompt(version: &str) -> Option<Self> {
+        let message = format!("发现 Codex Taskboard {version}。是否现在下载、安装并重启？");
+        let (response, result) = std::sync::mpsc::channel();
+        let dialog = run_on_main(move |mtm| {
+            let alert = NSAlert::new(mtm);
+            let target = UpdateDialogTarget::new(mtm, response);
+            alert.setMessageText(&NSString::from_str("Codex Taskboard 更新"));
+            alert.setInformativeText(&NSString::from_str(&message));
+            let install_button = alert.addButtonWithTitle(&NSString::from_str("立即更新"));
+            let defer_button = alert.addButtonWithTitle(&NSString::from_str("稍后"));
+            unsafe {
+                install_button.setTarget(Some(&target));
+                install_button.setAction(Some(sel!(acceptUpdate:)));
+                defer_button.setTarget(Some(&target));
+                defer_button.setAction(Some(sel!(deferUpdate:)));
+            }
+            alert.layout();
+            let window = alert.window();
+            window.center();
+            NSApplication::sharedApplication(mtm).activate();
+            window.makeKeyAndOrderFront(None);
+            Self {
+                native: Arc::new(MainThreadBound::new(
+                    NativeUpdateDialog {
+                        alert,
+                        install_button,
+                        defer_button,
+                        _target: target,
+                    },
+                    mtm,
+                )),
+            }
+        });
+        if result.recv().unwrap() {
+            Some(dialog)
+        } else {
+            dialog.close();
+            None
+        }
+    }
+
+    fn show_progress(&self, message: &str) {
+        let native = Arc::clone(&self.native);
+        let message = message.to_owned();
+        run_on_main(move |mtm| {
+            let native = native.get(mtm);
+            native
+                .alert
+                .setInformativeText(&NSString::from_str(&message));
+            native.install_button.setHidden(true);
+            native.defer_button.setHidden(true);
+            native.alert.layout();
+        });
+    }
+
+    fn set_message(&self, message: &str) {
+        let native = Arc::clone(&self.native);
+        let message = message.to_owned();
+        run_on_main(move |mtm| {
+            let alert = &native.get(mtm).alert;
+            alert.setInformativeText(&NSString::from_str(&message));
+            alert.layout();
+        });
+    }
+
+    fn close(&self) {
+        let native = Arc::clone(&self.native);
+        run_on_main(move |mtm| {
+            native.get(mtm).alert.window().close();
+        });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone)]
+struct UpdateDialog;
+
+#[cfg(not(target_os = "macos"))]
+impl UpdateDialog {
+    fn prompt(_version: &str) -> Option<Self> {
+        None
+    }
+
+    fn show_progress(&self, _message: &str) {}
+
+    fn set_message(&self, _message: &str) {}
+
+    fn close(&self) {}
 }
 
 impl LauncherState {
@@ -923,7 +1088,7 @@ async fn install_update(
     app: &AppHandle,
     state: &Arc<LauncherState>,
     update: Update,
-    check_update: &MenuItem<tauri::Wry>,
+    update_dialog: &UpdateDialog,
 ) -> Result<(), String> {
     let update_version = update.version.clone();
     state.update_in_progress.store(true, Ordering::SeqCst);
@@ -931,14 +1096,14 @@ async fn install_update(
         snapshot.update_message = format!("正在下载 {update_version}…");
         snapshot.update_available = false;
     });
-    check_update.set_text(&snapshot.update_message).unwrap();
+    update_dialog.show_progress(&snapshot.update_message);
     let progress_app = app.clone();
     let progress_state = Arc::clone(state);
     let progress_version = update_version.clone();
-    let progress_menu = check_update.clone();
+    let progress_dialog = update_dialog.clone();
     let finish_app = app.clone();
     let finish_state = Arc::clone(state);
-    let finish_menu = check_update.clone();
+    let finish_dialog = update_dialog.clone();
     let mut downloaded = 0_u64;
     let bytes = match update
         .download(
@@ -956,13 +1121,13 @@ async fn install_update(
                         None => format!("正在下载 {progress_version}…"),
                     };
                 });
-                progress_menu.set_text(&snapshot.update_message).unwrap();
+                progress_dialog.set_message(&snapshot.update_message);
             },
             move || {
                 let snapshot = update_snapshot(&finish_app, &finish_state, |snapshot| {
                     snapshot.update_message = "正在验证更新…".into();
                 });
-                finish_menu.set_text(&snapshot.update_message).unwrap();
+                finish_dialog.set_message(&snapshot.update_message);
             },
         )
         .await
@@ -971,11 +1136,10 @@ async fn install_update(
         Err(error) => {
             append_log(state, &format!("Update download failed: {error}"));
             state.update_in_progress.store(false, Ordering::SeqCst);
-            let snapshot = update_snapshot(app, state, |snapshot| {
+            update_snapshot(app, state, |snapshot| {
                 snapshot.update_message = format!("更新下载或签名验证失败：{error}");
                 snapshot.update_available = true;
             });
-            check_update.set_text(&snapshot.update_message).unwrap();
             return Err(error.to_string());
         }
     };
@@ -983,7 +1147,7 @@ async fn install_update(
     let snapshot = update_snapshot(app, state, |snapshot| {
         snapshot.update_message = "正在安装更新…".into();
     });
-    check_update.set_text(&snapshot.update_message).unwrap();
+    update_dialog.set_message(&snapshot.update_message);
     {
         let _lifecycle = state.lifecycle.lock().unwrap();
         if state.intentional_stop.load(Ordering::SeqCst) {
@@ -1011,7 +1175,7 @@ async fn install_update(
                 "Taskboard restarted after update installation failure",
             );
         }
-        let snapshot = update_snapshot(app, state, |snapshot| {
+        update_snapshot(app, state, |snapshot| {
             snapshot.update_message = format!("更新安装失败：{error}");
             snapshot.update_available = true;
             if let Some(restart_error) = &restart_error {
@@ -1019,7 +1183,6 @@ async fn install_update(
                 snapshot.message = format!("任务面板恢复失败：{restart_error}");
             }
         });
-        check_update.set_text(&snapshot.update_message).unwrap();
         return Err(error.to_string());
     }
 
@@ -1030,7 +1193,7 @@ async fn install_update(
     let snapshot = update_snapshot(app, state, |snapshot| {
         snapshot.update_message = "正在重启…".into();
     });
-    check_update.set_text(&snapshot.update_message).unwrap();
+    update_dialog.set_message(&snapshot.update_message);
     app.restart()
 }
 
@@ -1072,7 +1235,6 @@ async fn offer_update(
         return;
     }
     check_update.set_enabled(false).unwrap();
-    check_update.set_text("正在检查更新…").unwrap();
     let update = match check_for_startup_update(app, state).await {
         Ok(update) => update,
         Err(error) => {
@@ -1106,25 +1268,14 @@ async fn offer_update(
 
     let version = update.version.clone();
     append_log(state, &format!("Showing update prompt for {version}"));
-    let install_now = app
-        .dialog()
-        .message(format!(
-            "发现 Codex Taskboard {version}。是否现在下载、安装并重启？"
-        ))
-        .title("Codex Taskboard 更新")
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "立即更新".into(),
-            "稍后".into(),
-        ))
-        .blocking_show();
-    if !install_now {
+    let Some(update_dialog) = UpdateDialog::prompt(&version) else {
         append_log(state, &format!("Update {version} deferred by user"));
         finish_update_flow(state, check_update, quit);
         return;
-    }
+    };
     append_log(state, &format!("Update {version} accepted by user"));
     quit.set_enabled(false).unwrap();
-    if let Err(error) = install_update(app, state, update, check_update).await {
+    if let Err(error) = install_update(app, state, update, &update_dialog).await {
         append_log(state, &format!("Update installation failed: {error}"));
         let service_recovered = state.snapshot.lock().unwrap().child_pid.is_some();
         let service_message = if service_recovered {
@@ -1132,6 +1283,7 @@ async fn offer_update(
         } else {
             "任务面板服务未能恢复，请重新打开 App。"
         };
+        update_dialog.close();
         show_error_dialog(
             app,
             "Codex Taskboard 更新失败",

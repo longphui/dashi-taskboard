@@ -302,6 +302,53 @@ test("issue move fetches the current version when --if-version is omitted", asyn
   });
 });
 
+test("issue move separates controller attribution from the task thread binding", async () => {
+  let requestBody;
+  const windowsWorkspacePath = String.raw`C:\Users\admin\Documents\dashi-taskboard`;
+  const result = await run([
+    "issue", "move", "TASK-1", "--status", "blocked", "--if-version", "3",
+    "--binding-thread-id", "remote-thread",
+    "--binding-codex-project-id", "remote-project",
+    "--binding-codex-project-kind", "remote",
+    "--binding-codex-host-id", "remote-host",
+    "--binding-workspace-path", windowsWorkspacePath,
+  ], async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return response({ task: { id: "TASK-1", version: 4 } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    status: "blocked",
+    threadId: "thread-current",
+    threadBinding: {
+      threadId: "remote-thread",
+      codexProjectId: "remote-project",
+      codexProjectKind: "remote",
+      codexHostId: "remote-host",
+      workspacePath: windowsWorkspacePath,
+    },
+    version: 3,
+  });
+});
+
+test("issue move can clear an unconfirmed task binding", async () => {
+  let requestBody;
+  const result = await run([
+    "issue", "move", "TASK-1", "--status", "todo", "--if-version", "3",
+    "--clear-binding-thread",
+  ], async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return response({ task: { id: "TASK-1", version: 4 } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    status: "todo",
+    threadId: "thread-current",
+    threadBinding: null,
+    version: 3,
+  });
+});
+
 test("an explicit --thread-id overrides CODEX_THREAD_ID on issue writes", async () => {
   let requestBody;
   const result = await run(

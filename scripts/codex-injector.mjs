@@ -1021,6 +1021,7 @@ async function requestCodexAutomationViaCdp(cdp, executionContextId, method, par
 async function requestCodexAppServerViaCdp(
   cdp,
   executionContextId,
+  hostId,
   method,
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
@@ -1053,7 +1054,7 @@ async function requestCodexAppServerViaCdp(
           !message
           || typeof message !== "object"
           || message.type !== "mcp-response"
-          || message.hostId !== "local"
+          || message.hostId !== ${JSON.stringify(hostId)}
           || message.message?.id !== requestId
         ) return;
         event.stopImmediatePropagation();
@@ -1073,7 +1074,7 @@ async function requestCodexAppServerViaCdp(
       window.addEventListener("message", onMessage, true);
       Promise.resolve(bridge.sendMessageFromView({
         type: "mcp-request",
-        hostId: "local",
+        hostId: ${JSON.stringify(hostId)},
         request: {
           id: requestId,
           method: ${JSON.stringify(method)},
@@ -1697,17 +1698,20 @@ async function applyTaskboardAutomationPolicy(
     ? { item: currentItem, items: listed.items }
     : await reconcileTaskboardAutomation({ ...request, taskboardMode, operation }, rpc);
   if (result?.error === "not-found") {
-    return { operation, ...(quota ? { quota } : {}) };
+    return { operation, taskboardMode, ...(quota ? { quota } : {}) };
   }
-  return { ...result, operation, ...(quota ? { quota } : {}) };
+  return { ...result, operation, taskboardMode, ...(quota ? { quota } : {}) };
 }
 
 function storedAutomationPolicy(request) {
   return {
     taskboardProjectId: request.taskboardProjectId,
     codexProjectId: request.codexProjectId,
+    codexProjectKind: request.codexProjectKind,
+    codexHostId: request.codexHostId,
     projectName: request.projectName,
     workspacePath: request.workspacePath,
+    remoteProjects: request.remoteProjects ?? [],
     skillPath: request.skillPath,
     ...(request.automationId ? { automationId: request.automationId } : {}),
     enabledByUser: request.enabledByUser,
@@ -1842,6 +1846,13 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         },
       );
       if (result.stale) return result;
+      if (
+        result.taskboardMode !== "local"
+        && !explicit && result.operation === "list" && result.item?.status === "PAUSED"
+      ) {
+        current.version += 1;
+        current.request = { ...current.request, enabledByUser: false };
+      }
       if (result.item?.id) {
         current.request = { ...current.request, automationId: result.item.id };
       }
@@ -1869,7 +1880,13 @@ async function updateAndApplyQuotaPolicy(request, rpc) {
   quotaPolicyRecords.set(request.taskboardProjectId, record);
   try {
     await persistQuotaPolicies();
-    return await enqueueQuotaPolicyMutation(record, rpc, { explicit: true });
+    const result = await enqueueQuotaPolicyMutation(record, rpc, { explicit: true });
+    const current = quotaPolicyRecords.get(request.taskboardProjectId);
+    return {
+      ...result,
+      policy: storedAutomationPolicy(current.request),
+      ...(current.quota ? { quota: current.quota } : {}),
+    };
   } catch (error) {
     if (quotaPolicyRecords.get(request.taskboardProjectId)?.version === record.version) {
       if (previous) quotaPolicyRecords.set(request.taskboardProjectId, previous);
@@ -1880,10 +1897,28 @@ async function updateAndApplyQuotaPolicy(request, rpc) {
   }
 }
 
-async function reconcileStoredAutomationPolicy(projectId, rpc) {
+async function reconcileStoredAutomationPolicy(request, rpc) {
   await ensureQuotaPoliciesLoaded();
+  const projectId = request.taskboardProjectId;
   const record = quotaPolicyRecords.get(projectId);
   if (!record) return null;
+  if (
+    record.request.codexProjectId !== request.codexProjectId
+    || record.request.codexProjectKind !== request.codexProjectKind
+    || record.request.codexHostId !== request.codexHostId
+    || record.request.workspacePath !== request.workspacePath
+    || JSON.stringify(record.request.remoteProjects ?? []) !== JSON.stringify(request.remoteProjects ?? [])
+  ) {
+    return updateAndApplyQuotaPolicy({
+      ...request,
+      automationId: record.request.automationId,
+      enabledByUser: record.request.enabledByUser,
+      quotaAware: record.request.quotaAware,
+      intervalMinutes: record.request.intervalMinutes,
+      model: record.request.model,
+      reasoningEffort: record.request.reasoningEffort,
+    }, rpc);
+  }
   const result = await enqueueQuotaPolicyMutation(record, rpc);
   const current = quotaPolicyRecords.get(projectId);
   return {
@@ -1931,7 +1966,7 @@ async function restoreQuotaPolicies(cdp) {
 }
 
 async function startTaskConversationViaCdp(cdp, executionContextId, request) {
-  const { instruction, previousThreadId, targetRoot, title } = request;
+  const { codexHostId, instruction, previousThreadId, targetRoot, title } = request;
   const normalizeWorkspaceRoot = (value) => {
     const root = String(value || "").trim();
     if (!root) return "";
@@ -1994,80 +2029,104 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
   if (!submitted) throw new Error("Codex new conversation composer did not become ready");
 
   const threadDeadline = Date.now() + 12_000;
-  while (Date.now() < threadDeadline) {
-    const started = await cdp.send("Runtime.evaluate", {
-      expression: `(() => {
-        const root = Array.from(document.querySelectorAll(
-          '[data-codex-composer-root][data-composer-placement="thread"]'
-        )).find((candidate) => candidate.getClientRects().length > 0);
-        const threadId = root
-          ?.querySelector('[data-above-composer-conversation-id]')
-          ?.getAttribute('data-above-composer-conversation-id')
-          ?.trim() || "";
-        return threadId.replace(/^(?:local|cloud):/i, "");
-      })()`,
-      contextId: executionContextId,
-      returnByValue: true,
-    });
-    const threadId = typeof started.result.value === "string" ? started.result.value : "";
-    if (threadId && threadId !== previousThreadId) {
-      const readyDeadline = Date.now() + 10_000;
-      let ready = false;
-      while (Date.now() < readyDeadline) {
+  let discoveredThreadId = "";
+  try {
+    while (Date.now() < threadDeadline) {
+      const started = await cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          const root = Array.from(document.querySelectorAll(
+            '[data-codex-composer-root][data-composer-placement="thread"]'
+          )).find((candidate) => candidate.getClientRects().length > 0);
+          const threadId = root
+            ?.querySelector('[data-above-composer-conversation-id]')
+            ?.getAttribute('data-above-composer-conversation-id')
+            ?.trim() || "";
+          return threadId.replace(/^(?:local|cloud):/i, "");
+        })()`,
+        contextId: executionContextId,
+        returnByValue: true,
+      });
+      const threadId = typeof started.result.value === "string" ? started.result.value : "";
+      if (threadId && threadId !== previousThreadId) {
+        discoveredThreadId = threadId;
+        const readyDeadline = Date.now() + 10_000;
+        let ready = false;
+        while (Date.now() < readyDeadline) {
+          try {
+            const result = await requestCodexAppServerViaCdp(
+              cdp,
+              executionContextId,
+              codexHostId,
+              "thread/read",
+              { threadId, includeTurns: false },
+              10_000,
+            );
+            if (
+              result?.thread?.id === threadId
+              && normalizeWorkspaceRoot(result.thread.cwd) === normalizedTargetRoot
+            ) {
+              ready = true;
+              break;
+            }
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+        if (!ready) throw new Error("Codex did not confirm the task conversation workspace root");
+
         try {
-          const result = await requestCodexAppServerViaCdp(
+          await requestCodexAppServerViaCdp(
             cdp,
             executionContextId,
-            "thread/read",
-            { threadId, includeTurns: false },
+            codexHostId,
+            "thread/name/set",
+            { threadId, name: title },
+            10_000,
           );
-          if (
-            result?.thread?.id === threadId
-            && normalizeWorkspaceRoot(result.thread.cwd) === normalizedTargetRoot
-          ) {
-            ready = true;
-            break;
-          }
-        } catch {}
-        await new Promise((resolve) => setTimeout(resolve, 80));
-      }
-      if (!ready) throw new Error("Codex did not confirm the task conversation workspace root");
-
-      try {
-        await requestCodexAppServerViaCdp(cdp, executionContextId, "thread/name/set", {
-          threadId,
-          name: title,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-        if (!message.includes("rollout") || !message.includes("is empty")) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        await requestCodexAppServerViaCdp(cdp, executionContextId, "thread/name/set", {
-          threadId,
-          name: title,
-        });
-      }
-
-      const titleDeadline = Date.now() + 10_000;
-      while (Date.now() < titleDeadline) {
-        try {
-          const result = await requestCodexAppServerViaCdp(
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message.toLowerCase()
+            : String(error).toLowerCase();
+          if (!message.includes("rollout") || !message.includes("is empty")) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await requestCodexAppServerViaCdp(
             cdp,
             executionContextId,
-            "thread/read",
-            { threadId, includeTurns: false },
+            codexHostId,
+            "thread/name/set",
+            { threadId, name: title },
+            10_000,
           );
-          if (result?.thread?.id === threadId && result.thread.name === title) {
-            return { threadId, title };
-          }
-        } catch {}
-        await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+
+        const titleDeadline = Date.now() + 10_000;
+        while (Date.now() < titleDeadline) {
+          try {
+            const result = await requestCodexAppServerViaCdp(
+              cdp,
+              executionContextId,
+              codexHostId,
+              "thread/read",
+              { threadId, includeTurns: false },
+              10_000,
+            );
+            if (result?.thread?.id === threadId && result.thread.name === title) {
+              return { threadId, title };
+            }
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+        throw new Error("Codex did not confirm the task conversation title");
       }
-      throw new Error("Codex did not confirm the task conversation title");
+      await new Promise((resolve) => setTimeout(resolve, 80));
     }
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    throw new Error("Timed out while starting the Codex conversation");
+  } catch (error) {
+    if (error && typeof error === "object") {
+      if (discoveredThreadId) error.threadId = discoveredThreadId;
+      else if (submitted) error.uncertain = true;
+    }
+    throw error;
   }
-  throw new Error("Timed out while starting the Codex conversation");
 }
 
 function getOrStartTaskConversation(cdp, executionContextId, request) {
@@ -2132,7 +2191,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
           );
           if (request.operation === "list") {
             const stored = await reconcileStoredAutomationPolicy(
-              request.taskboardProjectId,
+              request,
               rpc,
             );
             return stored ?? reconcileTaskboardAutomation(request, rpc);

@@ -1,6 +1,6 @@
 [package]
 name = "codex-taskboard-launcher"
-version = "1.0.3"
+version = "1.0.4"
 description = "Codex Taskboard macOS launcher"
 edition = "2021"
 rust-version = "1.88"
@@ -17,3 +17,9 @@ tauri-plugin-autostart = "2.5.1"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-updater = "2.10.1"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }

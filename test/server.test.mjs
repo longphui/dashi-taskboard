@@ -893,6 +893,15 @@ test("existing task and comment thread attribution remains content-specific", as
   const result = await request(baseUrl, "/api/tasks/legacy-task");
   assert.equal(result.response.status, 200);
   assert.equal(result.body.task.threadId, "legacy-thread");
+  assert.equal(result.body.task.threadBinding, null);
+  assert.equal(result.body.task.legacyLocalThreadId, "legacy-thread");
+  assert.deepEqual(result.body.task.conversationRefs.map((ref) => ({
+    threadId: ref.threadId,
+    legacyLocal: ref.legacyLocal,
+  })), [
+    { threadId: "legacy-thread", legacyLocal: true },
+    { threadId: "legacy-comment-thread", legacyLocal: true },
+  ]);
   assert.equal(result.body.task.creatorType, "agent");
   assert.equal(result.body.task.creatorId, "codex-agent");
   assert.equal(result.body.task.creatorName, "Codex Agent");
@@ -918,6 +927,8 @@ test("existing task and comment thread attribution remains content-specific", as
   assert.equal(taskThreads, undefined);
   const comments = await request(baseUrl, "/api/tasks/legacy-task/comments");
   assert.equal(comments.body.comments[0].threadId, "legacy-comment-thread");
+  assert.equal(comments.body.comments[0].threadBinding, null);
+  assert.equal(comments.body.comments[0].legacyLocalThreadId, "legacy-comment-thread");
   assert.equal(comments.body.comments[0].authorType, "agent");
   assert.equal(comments.body.comments[0].authorId, "codex-agent");
   assert.equal(comments.body.comments[0].authorName, "Codex Agent");
@@ -1242,6 +1253,101 @@ test("moving a task updates its status and sort order", async () => {
   assert.equal(moveResult.body.task.sortOrder, 2500.5);
   assert.equal(moveResult.body.task.threadId, "thread-move");
   assert.equal(moveResult.body.task.version, 2);
+});
+
+test("remote task bindings keep their own identity and can be cleared independently", async () => {
+  const baseUrl = await startServer();
+  const legacy = (await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { title: "Legacy binding", threadId: "legacy-thread" },
+  })).body.task;
+  assert.equal(legacy.threadId, "legacy-thread");
+  assert.equal(legacy.threadBinding, null);
+  assert.equal(legacy.legacyLocalThreadId, "legacy-thread");
+  assert.deepEqual(legacy.conversationRefs.map((ref) => ({
+    threadId: ref.threadId,
+    legacyLocal: ref.legacyLocal,
+  })), [{ threadId: "legacy-thread", legacyLocal: true }]);
+  const binding = {
+    threadId: "remote-thread-a",
+    codexProjectId: "remote-project-a",
+    codexProjectKind: "remote",
+    codexHostId: "ssh-a",
+    workspacePath: "/same/remote/path",
+  };
+  const created = (await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { title: "Remote binding", threadId: binding.threadId, threadBinding: binding },
+  })).body.task;
+  assert.deepEqual(created.threadBinding, binding);
+  assert.deepEqual(created.conversationRefs.map((ref) => ref.codexHostId), ["ssh-a"]);
+
+  const controllerComment = (await request(baseUrl, `/api/tasks/${created.id}/comments`, {
+    method: "POST",
+    body: { body: "Controller note", threadId: "controller-thread" },
+  })).body.comment;
+  assert.equal(controllerComment.threadBinding, null);
+  assert.equal(controllerComment.legacyLocalThreadId, "controller-thread");
+
+  const blocked = (await request(baseUrl, `/api/tasks/${created.id}/move`, {
+    method: "POST",
+    body: {
+      version: created.version,
+      status: "blocked",
+      threadId: "controller-thread",
+      threadBinding: binding,
+    },
+  })).body.task;
+  assert.equal(blocked.threadId, binding.threadId);
+  assert.deepEqual(blocked.threadBinding, binding);
+  assert.deepEqual(blocked.conversationRefs.map((ref) => ({
+    threadId: ref.threadId,
+    legacyLocal: ref.legacyLocal ?? false,
+  })), [
+    { threadId: binding.threadId, legacyLocal: false },
+    { threadId: "controller-thread", legacyLocal: true },
+  ]);
+
+  const restored = (await request(baseUrl, `/api/tasks/${created.id}/move`, {
+    method: "POST",
+    body: {
+      version: blocked.version,
+      status: "todo",
+      threadId: "controller-thread",
+      threadBinding: null,
+    },
+  })).body.task;
+  assert.equal(restored.threadId, null);
+  assert.equal(restored.threadBinding, null);
+  assert.deepEqual(restored.conversationRefs.map((ref) => ref.threadId), ["controller-thread"]);
+});
+
+test("the active local Codex conversation supplies its exact task binding identity", async () => {
+  const baseUrl = await startServer();
+  const runtime = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    body: {
+      threadId: "local-thread",
+      threadRunning: true,
+      threadTodoProgress: null,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/work/local-project",
+    },
+  });
+  assert.equal(runtime.response.status, 200);
+  const task = (await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { title: "Local binding", threadId: "local-thread" },
+  })).body.task;
+  assert.deepEqual(task.threadBinding, {
+    threadId: "local-thread",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/work/local-project",
+  });
 });
 
 test("tasks can bind, change, and unbind one project workflow", async () => {

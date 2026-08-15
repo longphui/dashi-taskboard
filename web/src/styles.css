@@ -2725,6 +2725,48 @@ kbd {
   font-size: inherit;
 }
 
+.issue-description-document .markdown-mermaid {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-height: 80px;
+  margin: 12px 0;
+  padding: 12px;
+  overflow: auto;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+}
+
+.issue-description-document .markdown-mermaid svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.issue-description-document .markdown-mermaid-fallback {
+  width: 100%;
+  color: var(--text-secondary);
+}
+
+.issue-description-document .markdown-mermaid-fallback p {
+  margin: 0 0 8px;
+  color: var(--danger);
+}
+
+.issue-description-document .markdown-mermaid-fallback summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.issue-description-document .markdown-mermaid-fallback pre {
+  margin-bottom: 0;
+}
+
+:root[data-theme="dark"] .issue-description-document .markdown-mermaid {
+  background: var(--surface-active);
+}
+
 .issue-description-document table {
   width: 100%;
   margin: 12px 0;
@@ -3880,9 +3922,16 @@ kbd {
 
 .comment-edit-actions {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
   gap: 6px;
   margin: 7px 16px 0;
+}
+
+.comment-edit-actions > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .comments-loading {
@@ -6233,6 +6282,42 @@ kbd {
 .property-control:hover {
   background: var(--surface-hover);
   color: var(--text-primary);
+}
+
+.property-relation-chip {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.property-relation-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0.5px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--surface-raised);
+  color: var(--text-tertiary);
+  opacity: 0;
+}
+
+.property-relation-chip:hover .property-relation-remove,
+.property-relation-chip:focus-within .property-relation-remove {
+  opacity: 1;
+}
+
+.property-relation-remove:hover {
+  background: var(--surface-active);
+  color: var(--text-primary);
+}
+
+.property-control .property-relation-remove svg {
+  width: 8px;
+  height: 8px;
 }
 
 .property-control svg {

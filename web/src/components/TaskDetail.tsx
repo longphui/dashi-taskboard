@@ -1,8 +1,4 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
-import ReactMarkdown from "react-markdown";
-import { defaultUrlTransform } from "react-markdown";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
 import { taskboardStorage } from "../storage";
 import {
   ApiError,
@@ -15,7 +11,6 @@ import {
   listTaskActivities,
   markdownIncludesAttachment,
   resolveTaskboardUrl,
-  resolvePersistedAttachmentUrl,
   uploadAttachment,
   uploadCommentAttachment,
   updateComment,
@@ -31,6 +26,7 @@ import type {
   ActorIdentity,
   Attachment,
   Comment,
+  CodexThreadBinding,
   DevelopmentContext,
   DevelopmentScan,
   IssueRelationType,
@@ -79,6 +75,7 @@ import { buildIssueUrl, readIssueIdentifier } from "../issueRoute";
 import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
+import { MarkdownDocument } from "./MarkdownDocument";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -106,7 +103,8 @@ interface TaskDetailProps {
     type: IssueRelationType,
     relatedTaskId: string,
   ) => Promise<RelationMutationResult>;
-  onOpenThread: (threadId: string) => void;
+  onOpenThread: (binding: CodexThreadBinding) => void;
+  onOpenLegacyLocalThread: (threadId: string) => void;
   onOpenInThread: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
   openingThread: boolean;
@@ -353,39 +351,22 @@ function DescriptionDocument({
   onOpenTask: (task: TaskRelationSummary) => void;
 }) {
   return (
-    <div className="issue-description-document">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkBreaks]}
-        urlTransform={(url) => defaultUrlTransform(resolvePersistedAttachmentUrl(url))}
-        components={{
-          a: ({ node: _node, href, ...props }) => {
-            const task = href ? referencedTask(href, tasks) : null;
-            return (
-              <a
-                {...props}
-                href={href}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(event) => {
-                  if (
-                    !task
-                    || event.button !== 0
-                    || event.metaKey
-                    || event.ctrlKey
-                    || event.shiftKey
-                    || event.altKey
-                  ) return;
-                  event.preventDefault();
-                  onOpenTask(task);
-                }}
-              />
-            );
-          },
-        }}
-      >
-        {value}
-      </ReactMarkdown>
-    </div>
+    <MarkdownDocument
+      value={value}
+      onLinkClick={(event, href) => {
+        const task = href ? referencedTask(href, tasks) : null;
+        if (
+          !task
+          || event.button !== 0
+          || event.metaKey
+          || event.ctrlKey
+          || event.shiftKey
+          || event.altKey
+        ) return;
+        event.preventDefault();
+        onOpenTask(task);
+      }}
+    />
   );
 }
 
@@ -394,7 +375,7 @@ function ConversationLink({
   onOpen,
 }: {
   threadId: string;
-  onOpen: (threadId: string) => void;
+  onOpen: () => void;
 }) {
   const { text } = useTaskboardI18n();
   return (
@@ -402,7 +383,7 @@ function ConversationLink({
       className="issue-conversation-link"
       type="button"
       title={text(`查看对话 ${threadId}`, `View conversation ${threadId}`)}
-      onClick={() => onOpen(threadId)}
+      onClick={onOpen}
     >
       <TaskboardIcon name="conversation" />
       <strong>{text("查看对话", "View conversation")}</strong>
@@ -429,6 +410,7 @@ export function TaskDetail({
   onAddRelation,
   onRemoveRelation,
   onOpenThread,
+  onOpenLegacyLocalThread,
   onOpenInThread,
   onCopy,
   openingThread,
@@ -527,7 +509,6 @@ export function TaskDetail({
 
   useEffect(() => {
     const controller = new AbortController();
-    setCommentsLoading(true);
     setCommentsError(null);
     void Promise.all([
       listComments(task.id, controller.signal),
@@ -1018,13 +999,18 @@ export function TaskDetail({
                       : text("添加描述…", "Add description…")}
                   </div>
                 )}
-                {(currentTask.threadId || currentTask.resumeRequest) && (
+                {(currentTask.threadBinding || currentTask.legacyLocalThreadId || currentTask.resumeRequest) && (
                   <div
                     className="issue-conversation-list"
                     aria-label={text("处理此议题的对话", "Conversations for this issue")}
                   >
-                    {currentTask.threadId && (
-                      <ConversationLink threadId={currentTask.threadId} onOpen={onOpenThread} />
+                    {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
+                      <ConversationLink
+                        threadId={currentTask.threadBinding?.threadId ?? currentTask.legacyLocalThreadId!}
+                        onOpen={() => currentTask.threadBinding
+                          ? onOpenThread(currentTask.threadBinding)
+                          : onOpenLegacyLocalThread(currentTask.legacyLocalThreadId!)}
+                      />
                     )}
                     {currentTask.resumeRequest && (
                       <span className={`issue-resume-status${currentTask.resumeRequest.status === "failed" ? " is-failed" : ""}`}>
@@ -1330,46 +1316,51 @@ export function TaskDetail({
                             }}
                           />
                           <div className="comment-edit-actions">
-                            <button
-                              className="button secondary"
-                              type="button"
-                              disabled={savingCommentId === comment.id}
-                              onClick={() => editCommentImageInputRef.current?.click()}
-                            >
-                              <LinearIcon name="attachment" />
-                              {text("添加图片", "Add images")}
-                            </button>
-                            <input
-                              ref={editCommentImageInputRef}
-                              type="file"
-                              accept="image/*"
-                              multiple
-                              hidden
-                              onChange={(event) => {
-                                if (event.currentTarget.files) {
-                                  editingComposerRef.current?.addImages(event.currentTarget.files);
-                                }
-                                event.currentTarget.value = "";
-                              }}
-                            />
-                            <button
-                              className="button secondary"
-                              type="button"
-                              disabled={savingCommentId === comment.id}
-                              onClick={endCommentEdit}
-                            >
-                              {text("取消", "Cancel")}
-                            </button>
-                            <button
-                              className="button primary"
-                              type="button"
-                              disabled={!editingDraft.trim() || savingCommentId === comment.id}
-                              onClick={() => void saveComment(comment)}
-                            >
-                              {savingCommentId === comment.id
-                                ? text("保存中…", "Saving…")
-                                : text("保存", "Save")}
-                            </button>
+                            <div className="composer-footer-leading">
+                              <button
+                                className="comment-attach-button"
+                                type="button"
+                                disabled={savingCommentId === comment.id}
+                                aria-label={text("添加评论附件", "Add comment attachments")}
+                                title={text("添加附件", "Add attachments")}
+                                onClick={() => editCommentImageInputRef.current?.click()}
+                              >
+                                <LinearIcon name="attachment" />
+                              </button>
+                              <input
+                                ref={editCommentImageInputRef}
+                                type="file"
+                                accept="image/*"
+                                multiple
+                                hidden
+                                onChange={(event) => {
+                                  if (event.currentTarget.files) {
+                                    editingComposerRef.current?.addImages(event.currentTarget.files);
+                                  }
+                                  event.currentTarget.value = "";
+                                }}
+                              />
+                            </div>
+                            <div>
+                              <button
+                                className="button secondary"
+                                type="button"
+                                disabled={savingCommentId === comment.id}
+                                onClick={endCommentEdit}
+                              >
+                                {text("取消", "Cancel")}
+                              </button>
+                              <button
+                                className="button primary"
+                                type="button"
+                                disabled={!editingDraft.trim() || savingCommentId === comment.id}
+                                onClick={() => void saveComment(comment)}
+                              >
+                                {savingCommentId === comment.id
+                                  ? text("保存中…", "Saving…")
+                                  : text("保存", "Save")}
+                              </button>
+                            </div>
                           </div>
                         </div>
                       ) : (
@@ -1412,9 +1403,14 @@ export function TaskDetail({
                             ))}
                         </ul>
                       )}
-                      {comment.threadId && (
+                      {(comment.threadBinding || comment.legacyLocalThreadId) && (
                         <div className="comment-conversation-link">
-                          <ConversationLink threadId={comment.threadId} onOpen={onOpenThread} />
+                          <ConversationLink
+                            threadId={comment.threadBinding?.threadId ?? comment.legacyLocalThreadId!}
+                            onOpen={() => comment.threadBinding
+                              ? onOpenThread(comment.threadBinding)
+                              : onOpenLegacyLocalThread(comment.legacyLocalThreadId!)}
+                          />
                         </div>
                       )}
                     </div>

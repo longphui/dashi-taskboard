@@ -24,6 +24,7 @@ import {
   archiveTask as archiveTaskRequest,
   createProjectLabel as createProjectLabelRequest,
   createProject as createProjectRequest,
+  createComment,
   createTask as createTaskRequest,
   configureJiraConnection,
   deleteArchivedTask as deleteArchivedTaskRequest,
@@ -33,6 +34,7 @@ import {
   getCodexThreadProgress,
   getHostRuntime,
   getJiraConnection,
+  getTask,
   getTaskboardRevision,
   getWorkflowWorkspace,
   getTaskboardMetadata,
@@ -40,6 +42,7 @@ import {
   listDevelopmentContexts,
   listDeviceWorkspaces,
   listProjects,
+  listComments,
   listTasks,
   moveTask as moveTaskRequest,
   publishHostRuntime,
@@ -114,6 +117,8 @@ import {
   TASK_STATUSES,
   type ActorIdentity,
   type AiChatThread,
+  type CodexProjectIdentity,
+  type CodexThreadBinding,
   type DevelopmentScan,
   type HostContext,
   type IssueRelationType,
@@ -184,6 +189,7 @@ interface ProjectChoice {
   issueCount: number;
   inCodex: boolean;
   persisted: boolean;
+  codexIdentity: CodexProjectIdentity | null;
 }
 
 interface ProjectContextMenuState {
@@ -202,6 +208,12 @@ interface UndoNotice {
   message: string;
 }
 
+interface PendingRemoteThreadClaim {
+  claimedTask: Task;
+  previousTask: Task;
+  identity: CodexProjectIdentity;
+}
+
 type ProjectAutomationStatus = "ACTIVE" | "PAUSED";
 type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
 type AutomationIntervalMinutes = 5 | 10 | 15 | 30 | 60;
@@ -216,6 +228,9 @@ interface AutomationQuotaStatus {
 interface ProjectAutomationRecord {
   automationId?: string;
   codexProjectId: string;
+  codexProjectKind: "local" | "remote";
+  codexHostId: string;
+  workspacePath: string;
   status: ProjectAutomationStatus;
   enabledByUser: boolean;
   quotaAware: boolean;
@@ -233,8 +248,11 @@ type ProjectAutomationOptions = Pick<
 interface AutomationRequestContext {
   taskboardProjectId: string;
   codexProjectId: string;
+  codexProjectKind: "local" | "remote";
+  codexHostId: string;
   projectName: string;
   workspacePath: string;
+  remoteProjects: CodexProjectIdentity[];
   skillPath: string;
 }
 
@@ -262,6 +280,10 @@ interface AutomationHostResponse {
   quota?: AutomationQuotaStatus;
   policy?: {
     automationId?: string;
+    codexProjectId: string;
+    codexProjectKind: "local" | "remote";
+    codexHostId: string;
+    workspacePath: string;
     enabledByUser: boolean;
     quotaAware: boolean;
     intervalMinutes: AutomationIntervalMinutes;
@@ -288,6 +310,7 @@ const GLOBAL_PROJECT_ID = "local";
 const RECENT_PROJECT_IDS_KEY = "taskboard.recentProjectIds.v1";
 const PROJECT_VIEW_KEY_PREFIX = "taskboard.project-view.v1.";
 const DEVICE_WORKSPACE_PATHS_KEY = "taskboard.deviceWorkspacePaths.v1";
+const PROJECT_CODEX_IDENTITIES_KEY = "taskboard.projectCodexIdentities.v1";
 const PROJECT_AUTOMATIONS_KEY = "taskboard.projectAutomations.v1";
 const ISSUE_READ_KEY_PREFIX = "taskboard.issue-read.v1";
 const FIRST_USE_COMPLETE_KEY = "taskboard.first-use-complete.v1";
@@ -371,6 +394,25 @@ function readDeviceWorkspacePaths(): Record<string, string> {
   }
 }
 
+function readProjectCodexIdentities(): Record<string, CodexProjectIdentity> {
+  try {
+    const value = JSON.parse(taskboardStorage.getItem(PROJECT_CODEX_IDENTITIES_KEY) ?? "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, CodexProjectIdentity] => {
+      const identity = entry[1] as Partial<CodexProjectIdentity> | null;
+      return Boolean(
+        identity
+        && typeof identity.codexProjectId === "string"
+        && (identity.codexProjectKind === "local" || identity.codexProjectKind === "remote")
+        && typeof identity.codexHostId === "string"
+        && typeof identity.workspacePath === "string",
+      );
+    }));
+  } catch {
+    return {};
+  }
+}
+
 function readProjectAutomations(): ProjectAutomations {
   try {
     const value = JSON.parse(taskboardStorage.getItem(PROJECT_AUTOMATIONS_KEY) ?? "{}");
@@ -386,6 +428,9 @@ function readProjectAutomations(): ProjectAutomations {
       if (
         (candidate.automationId !== undefined && typeof candidate.automationId !== "string")
         || typeof candidate.codexProjectId !== "string"
+        || (candidate.codexProjectKind !== "local" && candidate.codexProjectKind !== "remote")
+        || typeof candidate.codexHostId !== "string"
+        || typeof candidate.workspacePath !== "string"
         || (candidate.status !== "ACTIVE" && candidate.status !== "PAUSED")
         || !isAutomationIntervalMinutes(candidate.intervalMinutes ?? 5)
         || !isAutomationModel(model)
@@ -399,6 +444,9 @@ function readProjectAutomations(): ProjectAutomations {
       result[projectId] = {
         automationId: candidate.automationId,
         codexProjectId: candidate.codexProjectId,
+        codexProjectKind: candidate.codexProjectKind,
+        codexHostId: candidate.codexHostId,
+        workspacePath: candidate.workspacePath,
         status: candidate.status,
         enabledByUser,
         quotaAware,
@@ -434,6 +482,10 @@ function isAutomationHostPolicy(
   return Boolean(
     value
     && (value.automationId === undefined || typeof value.automationId === "string")
+    && typeof value.codexProjectId === "string"
+    && (value.codexProjectKind === "local" || value.codexProjectKind === "remote")
+    && typeof value.codexHostId === "string"
+    && typeof value.workspacePath === "string"
     && typeof value.enabledByUser === "boolean"
     && typeof value.quotaAware === "boolean"
     && isAutomationIntervalMinutes(value.intervalMinutes)
@@ -715,6 +767,7 @@ export function App() {
   const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
+  const [projectCodexIdentities, setProjectCodexIdentities] = useState(readProjectCodexIdentities);
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
   const [automationPending, setAutomationPending] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -746,6 +799,7 @@ export function App() {
     );
   }
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
+  const pendingRemoteThreadClaimsRef = useRef(new Map<string, PendingRemoteThreadClaim>());
   const automationRequestInFlightRef = useRef<"list" | "save" | null>(null);
   const loadedAutomationProjectIdsRef = useRef(new Set<string>());
   const queuedAutomationSavesRef = useRef(new Map<string, QueuedProjectAutomationSave>());
@@ -820,7 +874,9 @@ export function App() {
     ? undefined
     : deviceWorkspacePaths[selectedProjectId];
   const selectedProjectAutomation = projectAutomations[selectedProjectId];
-  const automationProjectContext = useMemo(() => {
+  const automationProjectContext = useMemo<Partial<CodexProjectIdentity> & {
+    unavailableReason: string | null;
+  }>(() => {
     if (!embedded || window.parent === window) {
       return { unavailableReason: text("仅可在 Codex App 中使用", "Available only in the Codex app") };
     }
@@ -831,20 +887,53 @@ export function App() {
       return { unavailableReason: text("请先选择项目", "Select a project first") };
     }
 
-    const directCodexProject = hostContext?.projects?.some(
-      (project) => project.id === selectedProject.id,
+    const savedIdentity = projectCodexIdentities[selectedProject.id];
+    if (savedIdentity?.codexProjectKind === "remote") {
+      const liveProject = hostContext?.projects?.find(
+        (project) => project.id === savedIdentity.codexProjectId,
+      );
+      if (
+        liveProject?.projectKind !== "remote"
+        || liveProject.hostId !== savedIdentity.codexHostId
+        || liveProject.workspacePath !== savedIdentity.workspacePath
+      ) {
+        return { unavailableReason: text(
+          "已保存的 SSH 远程项目或主机当前不可用",
+          "The saved SSH remote project or host is not available",
+        ) };
+      }
+      if (!manageTaskboardSkillPath) {
+        return { unavailableReason: text(
+          "任务面板还没有读取到 Skill 路径",
+          "Taskboard has not received the Skill path",
+        ) };
+      }
+      return { ...savedIdentity, unavailableReason: null };
+    }
+
+    const effectiveCodexProjectId = selectedProject.id === GLOBAL_PROJECT_ID
+      ? hostContext?.projectId
+      : selectedProject.id;
+    const directCodexProject = hostContext?.projects?.find(
+      (project) => project.id === effectiveCodexProjectId,
     );
-    const workspacePath = deviceWorkspacePaths[selectedProject.id]
+    const workspacePath = (
+      directCodexProject?.projectKind === "remote"
+        ? directCodexProject.workspacePath
+        : undefined
+    )
+      ?? deviceWorkspacePaths[selectedProject.id]
       ?? selectedProject.workspacePath
+      ?? directCodexProject?.workspacePath
       ?? (
-        directCodexProject && hostContext?.projectId === selectedProject.id
-          ? hostContext.workspacePath
+        directCodexProject && hostContext?.projectId === effectiveCodexProjectId
+          ? hostContext?.workspacePath
           : undefined
       );
     const codexProjectId = directCodexProject
-      ? selectedProject.id
+      ? directCodexProject.id
       : hostContext?.projects?.find(
-        (project) => deviceWorkspacePaths[project.id] === workspacePath,
+        (project) => (deviceWorkspacePaths[project.id] ?? project.workspacePath) === workspacePath,
       )?.id;
 
     if (!workspacePath || !codexProjectId) {
@@ -859,12 +948,20 @@ export function App() {
         "Taskboard has not received the Skill path",
       ) };
     }
-    return { workspacePath, codexProjectId, unavailableReason: null };
+    const codexProject = hostContext?.projects?.find((project) => project.id === codexProjectId);
+    return {
+      workspacePath,
+      codexProjectId,
+      codexProjectKind: codexProject?.projectKind ?? "local",
+      codexHostId: codexProject?.hostId ?? "local",
+      unavailableReason: null,
+    };
   }, [
     deviceWorkspacePaths,
     embedded,
     hostContext,
     manageTaskboardSkillPath,
+    projectCodexIdentities,
     selectedProject,
     text,
   ]);
@@ -872,17 +969,39 @@ export function App() {
     if (
       !selectedProject
       || !automationProjectContext.codexProjectId
+      || !automationProjectContext.codexProjectKind
+      || !automationProjectContext.codexHostId
       || !automationProjectContext.workspacePath
       || !manageTaskboardSkillPath
     ) return null;
     return {
       taskboardProjectId: selectedProject.id,
       codexProjectId: automationProjectContext.codexProjectId,
+      codexProjectKind: automationProjectContext.codexProjectKind,
+      codexHostId: automationProjectContext.codexHostId,
       projectName: selectedProject.name,
       workspacePath: automationProjectContext.workspacePath,
+      remoteProjects: automationProjectContext.codexProjectKind === "remote"
+        ? (hostContext?.projects ?? [])
+            .filter((project) => (
+              project.projectKind === "remote"
+              && project.hostId === automationProjectContext.codexHostId
+              && typeof project.workspacePath === "string"
+            ))
+            .map((project) => ({
+              codexProjectId: project.id,
+              codexProjectKind: "remote" as const,
+              codexHostId: project.hostId!,
+              workspacePath: project.workspacePath!,
+            }))
+            .sort((left, right) => (
+              left.workspacePath.localeCompare(right.workspacePath)
+              || left.codexProjectId.localeCompare(right.codexProjectId)
+            ))
+        : [],
       skillPath: manageTaskboardSkillPath,
     };
-  }, [automationProjectContext, manageTaskboardSkillPath, selectedProject]);
+  }, [automationProjectContext, hostContext, manageTaskboardSkillPath, selectedProject]);
   const detailTask = detailTaskIdentifier
     ? tasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
     : null;
@@ -906,6 +1025,14 @@ export function App() {
         issueCount: persistedById.get(project.id)?.issueCount ?? 0,
         inCodex: true,
         persisted: persistedById.has(project.id),
+        codexIdentity: project.workspacePath && project.projectKind && project.hostId
+          ? {
+              codexProjectId: project.id,
+              codexProjectKind: project.projectKind,
+              codexHostId: project.hostId,
+              workspacePath: project.workspacePath,
+            }
+          : null,
       });
     }
     for (const project of projects) {
@@ -916,6 +1043,7 @@ export function App() {
         issueCount: project.issueCount,
         inCodex: false,
         persisted: true,
+        codexIdentity: projectCodexIdentities[project.id] ?? null,
       });
     }
     const recentOrder = new Map(recentProjectIds.map((projectId, index) => [projectId, index]));
@@ -923,7 +1051,7 @@ export function App() {
       (recentOrder.get(left.id) ?? recentProjectIds.length)
       - (recentOrder.get(right.id) ?? recentProjectIds.length)
     ));
-  }, [hostContext?.projects, projects, recentProjectIds, text]);
+  }, [hostContext?.projects, projectCodexIdentities, projects, recentProjectIds, text]);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const issueReadStorageKey = selectedProjectId
     ? `${ISSUE_READ_KEY_PREFIX}:${taskboardMetadata?.mode ?? "local"}:${selectedProjectId}`
@@ -982,6 +1110,9 @@ export function App() {
         record
         && current[projectId]?.automationId === record.automationId
         && current[projectId]?.codexProjectId === record.codexProjectId
+        && current[projectId]?.codexProjectKind === record.codexProjectKind
+        && current[projectId]?.codexHostId === record.codexHostId
+        && current[projectId]?.workspacePath === record.workspacePath
         && current[projectId]?.status === record.status
         && current[projectId]?.enabledByUser === record.enabledByUser
         && current[projectId]?.quotaAware === record.quotaAware
@@ -1025,8 +1156,11 @@ export function App() {
         operation,
         taskboardProjectId: context.taskboardProjectId,
         codexProjectId: context.codexProjectId,
+        codexProjectKind: context.codexProjectKind,
+        codexHostId: context.codexHostId,
         projectName: context.projectName,
         workspacePath: context.workspacePath,
+        remoteProjects: context.remoteProjects,
         skillPath: context.skillPath,
         ...(automationId ? { automationId } : {}),
         enabledByUser: options.enabledByUser,
@@ -1061,16 +1195,26 @@ export function App() {
           previousRecord?.automationId,
         );
         const item = isAutomationHostItem(response.item) ? response.item : undefined;
+        const policy = isAutomationHostPolicy(response.policy) ? response.policy : null;
+        if (!policy) {
+          throw new Error(textRef.current(
+            "Codex 没有返回实际生效的自动化策略",
+            "Codex did not return the effective automation policy.",
+          ));
+        }
         writeProjectAutomation(queuedSave.projectId, {
-          automationId: item?.id,
-          codexProjectId: queuedSave.context.codexProjectId,
+          automationId: item?.id ?? policy.automationId,
+          codexProjectId: policy.codexProjectId,
+          codexProjectKind: policy.codexProjectKind,
+          codexHostId: policy.codexHostId,
+          workspacePath: policy.workspacePath,
           status: item?.status ?? "PAUSED",
-          enabledByUser: queuedSave.options.enabledByUser,
-          quotaAware: queuedSave.options.quotaAware,
+          enabledByUser: policy.enabledByUser,
+          quotaAware: policy.quotaAware,
           ...(response.quota ? { quota: response.quota } : {}),
-          intervalMinutes: queuedSave.options.intervalMinutes,
-          model: queuedSave.options.model,
-          reasoningEffort: queuedSave.options.reasoningEffort,
+          intervalMinutes: policy.intervalMinutes,
+          model: policy.model,
+          reasoningEffort: policy.reasoningEffort,
         });
       } catch (error) {
         writeProjectAutomation(queuedSave.projectId, previousRecord);
@@ -1111,6 +1255,7 @@ export function App() {
         ? response.items.filter(isAutomationHostItem)
         : [];
       const policy = isAutomationHostPolicy(response.policy) ? response.policy : null;
+      const effectiveProjectIdentity = policy ?? automationRequestContext;
       if (!stored) {
         if (!policy) return;
         const item = (isAutomationHostItem(response.item) ? response.item : undefined)
@@ -1118,7 +1263,10 @@ export function App() {
           ?? (items.length === 1 ? items[0] : undefined);
         writeProjectAutomation(projectId, {
           automationId: item?.id ?? policy.automationId,
-          codexProjectId: automationRequestContext.codexProjectId,
+          codexProjectId: policy.codexProjectId,
+          codexProjectKind: policy.codexProjectKind,
+          codexHostId: policy.codexHostId,
+          workspacePath: policy.workspacePath,
           status: item?.status ?? "PAUSED",
           enabledByUser: policy.enabledByUser,
           quotaAware: policy.quotaAware,
@@ -1137,19 +1285,29 @@ export function App() {
           writeProjectAutomation(projectId, {
             ...stored,
             automationId: undefined,
+            codexProjectId: effectiveProjectIdentity.codexProjectId,
+            codexProjectKind: effectiveProjectIdentity.codexProjectKind,
+            codexHostId: effectiveProjectIdentity.codexHostId,
+            workspacePath: effectiveProjectIdentity.workspacePath,
             status: "PAUSED",
             enabledByUser: policy?.enabledByUser ?? stored.enabledByUser,
             quotaAware: policy?.quotaAware ?? stored.quotaAware,
             ...(response.quota ? { quota: response.quota } : {}),
+            intervalMinutes: policy?.intervalMinutes ?? stored.intervalMinutes,
+            model: policy?.model ?? stored.model,
+            reasoningEffort: policy?.reasoningEffort ?? stored.reasoningEffort,
           });
         }
         return;
       }
-      const intervalMinutes = intervalMinutesFromRrule(item.rrule);
+      const intervalMinutes = policy?.intervalMinutes ?? intervalMinutesFromRrule(item.rrule);
       if (!intervalMinutes) return;
       writeProjectAutomation(projectId, {
         automationId: item.id,
-        codexProjectId: automationRequestContext.codexProjectId,
+        codexProjectId: effectiveProjectIdentity.codexProjectId,
+        codexProjectKind: effectiveProjectIdentity.codexProjectKind,
+        codexHostId: effectiveProjectIdentity.codexHostId,
+        workspacePath: effectiveProjectIdentity.workspacePath,
         status: item.status,
         enabledByUser: policy?.enabledByUser ?? stored.enabledByUser,
         quotaAware: policy?.quotaAware ?? stored.quotaAware,
@@ -1161,8 +1319,8 @@ export function App() {
               : {}
         ),
         intervalMinutes,
-        model: item.model,
-        reasoningEffort: item.reasoningEffort,
+        model: policy?.model ?? item.model,
+        reasoningEffort: policy?.reasoningEffort ?? item.reasoningEffort,
       });
     } catch (error) {
       setAutomationError(error instanceof Error
@@ -1409,17 +1567,44 @@ export function App() {
         return;
       }
 
-      if (message.type === "taskboard:thread-prepared") {
-        setOpeningThreadTaskId(null);
+      if (message.type === "taskboard:thread-prepared" && message.payload) {
+        const payload = message.payload as { taskId?: unknown; threadId?: unknown };
+        if (typeof payload.taskId === "string" && pendingRemoteThreadClaimsRef.current.has(payload.taskId)) {
+          void bindPreparedRemoteThread(payload.taskId, payload.threadId);
+        } else {
+          setOpeningThreadTaskId(null);
+        }
         return;
       }
 
       if (message.type === "taskboard:thread-create-error" && message.payload) {
-        const payload = message.payload as { taskId?: unknown; error?: unknown };
-        setOpeningThreadTaskId(null);
+        const payload = message.payload as {
+          taskId?: unknown;
+          error?: unknown;
+          threadId?: unknown;
+          uncertain?: unknown;
+        };
+        if (typeof payload.taskId === "string" && pendingRemoteThreadClaimsRef.current.has(payload.taskId)) {
+          void compensateFailedRemoteThread(
+            payload.taskId,
+            payload.error,
+            payload.threadId,
+            payload.uncertain === true,
+          );
+        } else {
+          setOpeningThreadTaskId(null);
+          setActionError(typeof payload.error === "string"
+            ? payload.error
+            : textRef.current("无法在 Codex 中创建对话。", "Could not create the conversation in Codex."));
+        }
+        return;
+      }
+
+      if (message.type === "taskboard:thread-open-error" && message.payload) {
+        const payload = message.payload as { error?: unknown };
         setActionError(typeof payload.error === "string"
           ? payload.error
-          : textRef.current("无法在 Codex 中创建对话。", "Could not create the conversation in Codex."));
+          : textRef.current("无法打开 Codex 对话。", "Could not open the Codex conversation."));
         return;
       }
 
@@ -2424,12 +2609,84 @@ export function App() {
     }
   }
 
-  function openThread(threadId: string) {
+  function codexProjectContextForTaskProject(taskboardProjectId: string) {
+    const taskboardProject = projects.find((project) => project.id === taskboardProjectId);
+    const savedIdentity = projectCodexIdentities[taskboardProjectId];
+    if (savedIdentity?.codexProjectKind === "remote") {
+      const liveProject = hostContext?.projects?.find(
+        (project) => project.id === savedIdentity.codexProjectId,
+      );
+      return liveProject?.projectKind === "remote"
+        && liveProject.hostId === savedIdentity.codexHostId
+        && liveProject.workspacePath === savedIdentity.workspacePath
+        ? savedIdentity
+        : null;
+    }
+    const effectiveCodexProjectId = taskboardProjectId === GLOBAL_PROJECT_ID
+      ? hostContext?.projectId
+      : taskboardProjectId;
+    const directCodexProject = hostContext?.projects?.find(
+      (project) => project.id === effectiveCodexProjectId,
+    );
+    const mappedWorkspacePath = taskboardProjectId === GLOBAL_PROJECT_ID
+      ? directCodexProject?.workspacePath ?? hostContext?.workspacePath
+      : deviceWorkspacePaths[taskboardProjectId]
+        ?? taskboardProject?.workspacePath
+        ?? directCodexProject?.workspacePath;
+    const codexProject = directCodexProject ?? hostContext?.projects?.find(
+      (project) => project.workspacePath === mappedWorkspacePath,
+    );
+    if (!codexProject) return null;
+    return {
+      codexProjectId: codexProject.id,
+      codexProjectKind: codexProject.projectKind ?? "local" as const,
+      codexHostId: codexProject.hostId ?? "local",
+      workspacePath: mappedWorkspacePath ?? codexProject.workspacePath,
+    };
+  }
+
+  function openThread(binding: CodexThreadBinding) {
+    const remoteProject = binding.codexProjectKind === "remote"
+      ? hostContext?.projects?.find((project) => (
+          project.id === binding.codexProjectId
+          && project.projectKind === "remote"
+          && project.hostId === binding.codexHostId
+          && project.workspacePath === binding.workspacePath
+        ))
+      : null;
+    if (binding.codexProjectKind === "remote" && !remoteProject) {
+      setActionError(text(
+        "该对话绑定的 SSH 远程项目或主机当前不可用。",
+        "The SSH remote project or host bound to this conversation is not available.",
+      ));
+      return;
+    }
     if (embedded && window.parent !== window) {
-      postEmbeddedHostMessage({ type: "taskboard:open-thread", payload: { threadId } });
+      postEmbeddedHostMessage({
+        type: "taskboard:open-thread",
+        payload: binding,
+      });
       return;
     }
 
+    if (binding.codexProjectKind === "remote") {
+      setActionError(text(
+        "请在 Codex App 中打开该 SSH 远程对话。",
+        "Open this SSH remote conversation in the Codex app.",
+      ));
+      return;
+    }
+    window.location.assign(`codex://threads/${encodeURIComponent(binding.threadId.trim())}`);
+  }
+
+  function openLegacyLocalThread(threadId: string) {
+    if (embedded && window.parent !== window) {
+      postEmbeddedHostMessage({
+        type: "taskboard:open-thread",
+        payload: { threadId, legacyLocal: true },
+      });
+      return;
+    }
     window.location.assign(`codex://threads/${encodeURIComponent(threadId.trim())}`);
   }
 
@@ -2441,7 +2698,11 @@ export function App() {
       }));
       return;
     }
-    if (conversation.nativeThreadId) openThread(conversation.nativeThreadId);
+    if (conversation.threadBinding) {
+      openThread(conversation.threadBinding);
+    } else if (conversation.legacyLocalThreadId) {
+      openLegacyLocalThread(conversation.legacyLocalThreadId);
+    }
   }
 
   function expandCodexSidebar() {
@@ -2449,11 +2710,266 @@ export function App() {
     postEmbeddedHostMessage({ type: "taskboard:expand-sidebar" });
   }
 
+  function remoteIdentityForTask(
+    task: Task,
+    baseIdentity: CodexProjectIdentity,
+  ): CodexProjectIdentity | null {
+    if (task.developmentContext?.type === "worktree") {
+      const worktreePath = task.developmentContext.path;
+      const matches = (hostContext?.projects ?? []).filter((project) => (
+        project.projectKind === "remote"
+        && project.hostId === baseIdentity.codexHostId
+        && project.workspacePath === worktreePath
+      ));
+      if (matches.length !== 1) return null;
+      return {
+        codexProjectId: matches[0].id,
+        codexProjectKind: "remote",
+        codexHostId: matches[0].hostId!,
+        workspacePath: matches[0].workspacePath!,
+      };
+    }
+    const liveProject = hostContext?.projects?.find((project) => (
+      project.id === baseIdentity.codexProjectId
+      && project.projectKind === "remote"
+      && project.hostId === baseIdentity.codexHostId
+      && project.workspacePath === baseIdentity.workspacePath
+    ));
+    return liveProject ? baseIdentity : null;
+  }
+
+  function remoteTaskInstruction(task: Task, comments: Awaited<ReturnType<typeof listComments>>) {
+    const commentText = comments.length === 0
+      ? "（无评论）"
+      : comments.map((comment) => (
+          `- ${comment.authorName}（${comment.createdAt}）\n${comment.body}`
+        )).join("\n\n");
+    return [
+      `处理 Taskboard 议题 ${task.identifier}：${task.title}`,
+      `\n完整描述：\n${task.description || "（无描述）"}`,
+      `\n全部评论：\n${commentText}`,
+      `\n开发上下文：\n${JSON.stringify(task.developmentContext)}`,
+      "\n本地 Taskboard 控制器已负责认领、对话绑定、评论和状态写回。远程 worker 不得运行 taskctl。请只完成实现和必要验证，并返回改动、验证结果、执行结果和剩余风险。",
+    ].join("\n");
+  }
+
+  function updateTaskFromRemoteThread(task: Task) {
+    setTasks((current) => sortTasks(current.map((candidate) => (
+      candidate.id === task.id ? task : candidate
+    ))));
+  }
+
+  async function addRemoteThreadFailureComment(taskId: string, body: string) {
+    try {
+      await createComment(taskId, body, undefined, null);
+      setCommentsRevision((current) => current + 1);
+    } catch {}
+  }
+
+  async function bindPreparedRemoteThread(taskId: string, rawThreadId: unknown) {
+    const pending = pendingRemoteThreadClaimsRef.current.get(taskId);
+    if (!pending) return;
+    const threadId = typeof rawThreadId === "string" ? rawThreadId.trim() : "";
+    if (!threadId) {
+      await compensateFailedRemoteThread(taskId, textRef.current(
+        "Codex 没有返回新对话 ID。",
+        "Codex did not return the new conversation ID.",
+      ));
+      return;
+    }
+    const binding: CodexThreadBinding = { threadId, ...pending.identity };
+    try {
+      const boundTask = await moveTaskRequest(
+        pending.claimedTask,
+        "in_progress",
+        pending.claimedTask.sortOrder,
+        binding,
+      );
+      pendingRemoteThreadClaimsRef.current.delete(taskId);
+      updateTaskFromRemoteThread(boundTask);
+      setOpeningThreadTaskId(null);
+      setAnnouncement(textRef.current(
+        `${boundTask.identifier} 已绑定到新的 SSH 对话。`,
+        `${boundTask.identifier} is bound to the new SSH conversation.`,
+      ));
+    } catch (error) {
+      let recoveredTask: Task | null = null;
+      if (!(error instanceof ApiError && error.code === "VERSION_CONFLICT")) {
+        try {
+          const latest = await getTask(taskId);
+          const bindingWasSaved = latest.status === "in_progress"
+            && latest.projectId === pending.claimedTask.projectId
+            && latest.archivedAt === null
+            && latest.threadBinding?.threadId === binding.threadId
+            && latest.threadBinding.codexProjectId === binding.codexProjectId
+            && latest.threadBinding.codexProjectKind === binding.codexProjectKind
+            && latest.threadBinding.codexHostId === binding.codexHostId
+            && latest.threadBinding.workspacePath === binding.workspacePath;
+          if (bindingWasSaved) {
+            recoveredTask = latest;
+          } else if (
+            latest.version === pending.claimedTask.version
+            && latest.projectId === pending.claimedTask.projectId
+            && latest.status === "in_progress"
+            && latest.archivedAt === null
+            && latest.threadId === null
+            && latest.threadBinding === null
+          ) {
+            recoveredTask = await moveTaskRequest(
+              latest,
+              "blocked",
+              undefined,
+              binding,
+            );
+          }
+        } catch {}
+      }
+      pendingRemoteThreadClaimsRef.current.delete(taskId);
+      setOpeningThreadTaskId(null);
+      if (recoveredTask) {
+        updateTaskFromRemoteThread(recoveredTask);
+        if (recoveredTask.status === "in_progress") return;
+      }
+      await addRemoteThreadFailureComment(taskId, textRef.current(
+        `已创建 SSH 对话 ${threadId}，但任务 binding 写入发生冲突或失败；未覆盖其他控制端的更新。`,
+        `SSH conversation ${threadId} was created, but saving the task binding conflicted or failed. No other controller update was overwritten.`,
+      ));
+      setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
+        ? textRef.current(
+          `SSH 对话 ${threadId} 已创建，但议题已在其他位置更新，未覆盖该更新。`,
+          `SSH conversation ${threadId} was created, but the issue changed elsewhere. That update was not overwritten.`,
+        )
+        : errorMessage(error));
+    }
+  }
+
+  async function compensateFailedRemoteThread(
+    taskId: string,
+    rawError: unknown,
+    rawThreadId?: unknown,
+    uncertain = false,
+  ) {
+    const pending = pendingRemoteThreadClaimsRef.current.get(taskId);
+    if (!pending) return;
+    pendingRemoteThreadClaimsRef.current.delete(taskId);
+    const error = typeof rawError === "string"
+      ? rawError
+      : textRef.current("无法创建 Codex 对话。", "Could not create the Codex conversation.");
+    const threadId = typeof rawThreadId === "string" ? rawThreadId.trim() : "";
+    const binding = threadId ? { threadId, ...pending.identity } : null;
+    const status: TaskStatus = threadId || uncertain ? "blocked" : pending.previousTask.status;
+    await addRemoteThreadFailureComment(taskId, threadId
+      ? textRef.current(
+        `SSH 对话 ${threadId} 已创建，但后续确认失败：${error}`,
+        `SSH conversation ${threadId} was created, but follow-up confirmation failed: ${error}`,
+      )
+      : uncertain
+        ? textRef.current(
+          `创建 SSH 对话的结果不确定，任务已停止自动重试：${error}`,
+          `The SSH conversation result is uncertain, so automatic retry was stopped: ${error}`,
+        )
+        : textRef.current(
+          `创建 SSH 对话失败，任务已退回 ${pending.previousTask.status}：${error}`,
+          `Creating the SSH conversation failed. The task was returned to ${pending.previousTask.status}: ${error}`,
+        ));
+    try {
+      const compensated = await moveTaskRequest(
+        pending.claimedTask,
+        status,
+        pending.previousTask.sortOrder,
+        binding,
+      );
+      updateTaskFromRemoteThread(compensated);
+    } catch (moveError) {
+      if (!(moveError instanceof ApiError && moveError.code === "VERSION_CONFLICT")) {
+        setActionError(errorMessage(moveError));
+      }
+    } finally {
+      setOpeningThreadTaskId(null);
+    }
+    setActionError(error);
+  }
+
+  async function openRemoteTaskInThread(task: Task, baseIdentity: CodexProjectIdentity) {
+    try {
+      const [latestTask, comments] = await Promise.all([getTask(task.id), listComments(task.id)]);
+      if (latestTask.threadBinding) {
+        setOpeningThreadTaskId(null);
+        openThread(latestTask.threadBinding);
+        return;
+      }
+      if (latestTask.status !== "todo" || latestTask.archivedAt !== null || latestTask.threadId) {
+        throw new Error(textRef.current(
+          "该议题已被其他控制器认领或绑定，请刷新后重试。",
+          "This issue was claimed or bound by another controller. Refresh and try again.",
+        ));
+      }
+      const identity = remoteIdentityForTask(latestTask, baseIdentity);
+      if (!identity) {
+        throw new Error(latestTask.developmentContext?.type === "worktree"
+          ? textRef.current(
+            "目标 SSH worktree 未在保存的主机中添加或映射。",
+            "The target SSH worktree is not added or mapped on the saved host.",
+          )
+          : textRef.current(
+            "已保存的 SSH 远程项目或主机当前不可用。",
+            "The saved SSH remote project or host is not available.",
+          ));
+      }
+      const claimedTask = await moveTaskRequest(latestTask, "in_progress", undefined, null);
+      pendingRemoteThreadClaimsRef.current.set(task.id, {
+        claimedTask,
+        previousTask: latestTask,
+        identity,
+      });
+      updateTaskFromRemoteThread(claimedTask);
+      postEmbeddedHostMessage({
+        type: "taskboard:create-thread",
+        payload: {
+          taskId: latestTask.id,
+          identifier: latestTask.identifier,
+          title: latestTask.title,
+          instruction: remoteTaskInstruction(latestTask, comments),
+          codexProjectId: identity.codexProjectId,
+          codexProjectKind: identity.codexProjectKind,
+          codexHostId: identity.codexHostId,
+          codexProjectWorkspacePath: identity.workspacePath,
+          workspacePath: identity.workspacePath,
+        },
+      });
+    } catch (error) {
+      setOpeningThreadTaskId(null);
+      setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
+        ? textRef.current(
+          "该议题已在其他位置更新，未创建重复对话。",
+          "This issue changed elsewhere. No duplicate conversation was created.",
+        )
+        : errorMessage(error));
+      if (selectedProjectId) void refreshTasks(selectedProjectId, { quiet: true });
+    }
+  }
+
   function openTaskInThread(task: Task) {
     const worktreePath = task.developmentContext?.type === "worktree"
       ? task.developmentContext.path
       : null;
+    const savedRemoteIdentity = projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
+      ? projectCodexIdentities[task.projectId]
+      : null;
+    const codexProjectContext = savedRemoteIdentity
+      ?? codexProjectContextForTaskProject(task.projectId);
+    if (
+      projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
+      && !codexProjectContext
+    ) {
+      setActionError(text(
+        "已保存的 SSH 远程项目或主机当前不可用。",
+        "The saved SSH remote project or host is not available.",
+      ));
+      return;
+    }
     const workspacePath = worktreePath
+      ?? codexProjectContext?.workspacePath
       ?? selectedDeviceWorkspacePath
       ?? selectedProject?.workspacePath
       ?? (
@@ -2471,14 +2987,23 @@ export function App() {
       ]);
       return;
     }
+    if (codexProjectContext?.codexProjectKind === "remote" && !codexProjectContext.workspacePath) {
+      setActionError(text(
+        "SSH 远程项目缺少精确工作目录映射。",
+        "The SSH remote project is missing its exact workspace mapping.",
+      ));
+      return;
+    }
     if (openingThreadTaskId) return;
-    const codexProjectId = selectedProject?.id === GLOBAL_PROJECT_ID
-      ? hostContext?.projectId
-      : hostContext?.projects?.some((project) => project.id === selectedProject?.id)
-        ? selectedProject?.id
-        : undefined;
     setOpeningThreadTaskId(task.id);
     setActionError(null);
+    if (codexProjectContext?.codexProjectKind === "remote" && codexProjectContext.workspacePath) {
+      void openRemoteTaskInThread(task, {
+        ...codexProjectContext,
+        workspacePath: codexProjectContext.workspacePath,
+      });
+      return;
+    }
     postEmbeddedHostMessage({
       type: "taskboard:create-thread",
       payload: {
@@ -2486,7 +3011,10 @@ export function App() {
         identifier: task.identifier,
         title: task.title,
         instruction,
-        codexProjectId,
+        codexProjectId: codexProjectContext?.codexProjectId,
+        codexProjectKind: codexProjectContext?.codexProjectKind ?? "local",
+        codexHostId: codexProjectContext?.codexHostId ?? "local",
+        codexProjectWorkspacePath: codexProjectContext?.workspacePath,
         workspacePath,
       },
     });
@@ -2530,6 +3058,14 @@ export function App() {
           project = nextProjects.find((candidate) => candidate.id === choice.id) ?? null;
           if (!project) throw error;
         }
+      }
+      if (choice.codexIdentity) {
+        setProjectCodexIdentities((current) => {
+          const next = { ...current, [project!.id]: choice.codexIdentity! };
+          taskboardStorage.setItem(PROJECT_CODEX_IDENTITIES_KEY, JSON.stringify(next));
+          return next;
+        });
+        rememberDeviceWorkspacePath(project.id, choice.codexIdentity.workspacePath);
       }
       changeProject(project.id);
     } catch (error) {
@@ -2654,6 +3190,12 @@ export function App() {
       setRecentProjectIds((current) => {
         const next = current.filter((candidate) => candidate !== project.id);
         taskboardStorage.setItem(RECENT_PROJECT_IDS_KEY, JSON.stringify(next));
+        return next;
+      });
+      setProjectCodexIdentities((current) => {
+        const next = { ...current };
+        delete next[project.id];
+        taskboardStorage.setItem(PROJECT_CODEX_IDENTITIES_KEY, JSON.stringify(next));
         return next;
       });
       setPendingProjectDelete(null);
@@ -3043,6 +3585,7 @@ export function App() {
               mutateTaskRelation("remove", current, type, relatedTaskId)
             )}
             onOpenThread={openThread}
+            onOpenLegacyLocalThread={openLegacyLocalThread}
             onOpenInThread={openTaskInThread}
             onCopy={(text, message) => void copyText(text, message)}
             openingThread={openingThreadTaskId === detailTask.id}

@@ -22,7 +22,7 @@ const sourceRuntimeFile = path.resolve(
   ".data",
   "launcher-runtime.json",
 );
-const BOOLEAN_OPTIONS = new Set(["json"]);
+const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread"]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
@@ -77,7 +77,18 @@ const COMMAND_OPTIONS = new Map([
       "json",
     ]),
   ],
-  ["issue move", new Set(["status", "thread-id", "if-version", "json"])],
+  ["issue move", new Set([
+    "status",
+    "thread-id",
+    "binding-thread-id",
+    "binding-codex-project-id",
+    "binding-codex-project-kind",
+    "binding-codex-host-id",
+    "binding-workspace-path",
+    "clear-binding-thread",
+    "if-version",
+    "json",
+  ])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
@@ -681,11 +692,61 @@ async function moveIssue(api, taskId, options, overrides) {
   const status = requiredOption(options, "status");
   assertStatus(status);
   const threadId = resolveThreadId(options, overrides);
+  const threadBinding = threadBindingFromOptions(options);
   return api.request("POST", `${taskPath(taskId)}/move`, {
     status,
     threadId,
+    ...optionalField("threadBinding", threadBinding),
     version: await resolveVersion(api, taskId, options["if-version"]),
   });
+}
+
+function threadBindingFromOptions(options) {
+  const fields = [
+    options["binding-thread-id"],
+    options["binding-codex-project-id"],
+    options["binding-codex-project-kind"],
+    options["binding-codex-host-id"],
+    options["binding-workspace-path"],
+  ];
+  if (options["clear-binding-thread"]) {
+    if (fields.some((field) => field !== undefined)) {
+      throw usageError("--clear-binding-thread cannot be combined with binding identity options");
+    }
+    return null;
+  }
+  if (fields.every((field) => field === undefined)) return undefined;
+  const threadId = requiredOption(options, "binding-thread-id").trim();
+  if (!threadId || threadId.length > 256) {
+    throw usageError("--binding-thread-id must contain 1 to 256 characters");
+  }
+  const identityFields = fields.slice(1);
+  if (identityFields.every((field) => field === undefined)) return { threadId };
+  if (identityFields.some((field) => field === undefined)) {
+    throw usageError("Binding identity requires project id, kind, host id, and workspace path");
+  }
+  const codexProjectId = options["binding-codex-project-id"].trim();
+  const codexProjectKind = options["binding-codex-project-kind"];
+  const codexHostId = options["binding-codex-host-id"].trim();
+  const workspacePath = options["binding-workspace-path"];
+  if (!codexProjectId || codexProjectId.length > 256) {
+    throw usageError("--binding-codex-project-id must contain 1 to 256 characters");
+  }
+  if (codexProjectKind !== "local" && codexProjectKind !== "remote") {
+    throw usageError("--binding-codex-project-kind must be local or remote");
+  }
+  if (
+    !codexHostId
+    || codexHostId.length > 256
+    || (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")
+  ) {
+    throw usageError("--binding-codex-host-id does not match the project kind");
+  }
+  if (!path.posix.isAbsolute(workspacePath) && !path.win32.isAbsolute(workspacePath)) {
+    throw usageError("--binding-workspace-path must be absolute");
+  }
+  return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
 }
 
 async function archiveIssue(api, taskId, options, overrides, action) {

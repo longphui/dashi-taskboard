@@ -15,6 +15,8 @@ const currentAutomationRequest = {
   operation: "ensure-active",
   taskboardProjectId: "local",
   codexProjectId: "codex-project",
+  codexProjectKind: "local",
+  codexHostId: "local",
   projectName: "Local",
   workspacePath: "/tmp/project",
   skillPath: "/tmp/manage-taskboard/SKILL.md",

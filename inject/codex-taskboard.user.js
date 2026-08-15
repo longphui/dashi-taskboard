@@ -25,6 +25,7 @@
   const REATTACH_DELAY_MS = 160;
   const FRAME_READY_TIMEOUT_MS = 12_000;
   const HOST_REQUEST_TIMEOUT_MS = 12_000;
+  const TASK_CONVERSATION_REQUEST_TIMEOUT_MS = 75_000;
   const HOST_HEARTBEAT_MAX_AGE_MS = 8_000;
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
   const FRAME_REFRESH_PARAM = "__codex_taskboard_refresh";
@@ -81,6 +82,7 @@
   let loadError = null;
   let lastFocusedElement = null;
   let hostContextSnapshot = null;
+  let codexProjectMetadata = new Map();
   let mutedNativeSelections = new Map();
   let openGeneration = 0;
   let pendingThreadCreation = null;
@@ -263,13 +265,7 @@
     if (!scroll) return null;
     const buttons = Array.from(scroll.querySelectorAll("button"));
     const plugin = buttons.find((button) => buttonMatches(button, PLUGIN_LABELS));
-    if (plugin && plugin.parentElement) {
-      const siblings = Array.from(plugin.parentElement.children).filter((child) => child.tagName === "BUTTON");
-      if (siblings.length >= 3) return plugin;
-      const wrappedSiblings = Array.from(plugin.parentElement.parentElement?.children || [])
-        .filter((child) => child.children.length === 1 && child.firstElementChild?.tagName === "BUTTON");
-      if (wrappedSiblings.length >= 3) return plugin;
-    }
+    if (plugin?.parentElement) return plugin;
 
     const firstSection = scroll.querySelector("[data-app-action-sidebar-section]");
     const sectionTop = firstSection?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY;
@@ -483,6 +479,47 @@
     return typeof selectedProject?.projectId === "string" ? selectedProject.projectId : "";
   }
 
+  async function readCodexProjectMetadata() {
+    const bootstrap = await window.electronBridge?.getInitialSidebarBootstrap?.();
+    const entries = new Map(
+      (Array.isArray(bootstrap?.globalStateEntries) ? bootstrap.globalStateEntries : [])
+        .map((entry) => [entry?.key, entry?.value]),
+    );
+    const metadata = new Map();
+    const localProjects = entries.get("local-projects");
+    if (localProjects && typeof localProjects === "object" && !Array.isArray(localProjects)) {
+      Object.entries(localProjects).forEach(([projectId, project]) => {
+        const id = projectId.trim();
+        const workspacePath = Array.isArray(project?.rootPaths)
+          ? project.rootPaths.find((root) => typeof root === "string" && root.trim())?.trim()
+          : "";
+        if (!id) return;
+        metadata.set(id, {
+          projectKind: "local",
+          hostId: "local",
+          ...(workspacePath ? { workspacePath } : {}),
+        });
+      });
+    }
+    const remoteProjects = entries.get("remote-projects");
+    if (Array.isArray(remoteProjects)) {
+      remoteProjects.forEach((project) => {
+        const id = typeof project?.id === "string" ? project.id.trim() : "";
+        const workspacePath = typeof project?.remotePath === "string"
+          ? project.remotePath.trim()
+          : "";
+        const hostId = typeof project?.hostId === "string" ? project.hostId.trim() : "";
+        if (!id || !workspacePath || !hostId) return;
+        metadata.set(id, {
+          projectKind: "remote",
+          workspacePath,
+          hostId,
+        });
+      });
+    }
+    return metadata;
+  }
+
   async function activeNativeWorkspaceRoots() {
     const roots = (await requestNativeFetch("active-workspace-roots", {}))?.roots;
     return Array.isArray(roots) ? roots.filter((root) => typeof root === "string") : [];
@@ -499,7 +536,7 @@
     return `${withoutTrailingSlash[0].toLowerCase()}${withoutTrailingSlash.slice(1)}`;
   }
 
-  function readCodexProjects() {
+  function readCodexProjects(metadata = codexProjectMetadata) {
     const seen = new Set();
     return Array.from(document.querySelectorAll("[data-app-action-sidebar-project-row]"))
       .flatMap((row) => {
@@ -511,7 +548,7 @@
         ).trim();
         if (!id || !name || seen.has(id)) return [];
         seen.add(id);
-        return [{ id, name }];
+        return [{ id, name, ...metadata.get(id) }];
       });
   }
 
@@ -536,9 +573,13 @@
 
   async function captureHostContext() {
     const todoProgress = nativeTodoProgress();
-    const selectedProjectId = await selectedNativeProjectId();
+    const [selectedProjectId, projectMetadata] = await Promise.all([
+      selectedNativeProjectId(),
+      readCodexProjectMetadata(),
+    ]);
+    codexProjectMetadata = projectMetadata;
     if (selectedProjectId) lastNativeProjectId = selectedProjectId;
-    let projects = readCodexProjects();
+    let projects = readCodexProjects(projectMetadata);
     let section = findProjectsSection();
     const sectionDeadline = Date.now() + 1_200;
     while (!section && Date.now() < sectionDeadline) {
@@ -556,7 +597,7 @@
       const deadline = Date.now() + 1_200;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 40));
-        projects = readCodexProjects();
+        projects = readCodexProjects(projectMetadata);
       } while ((projects.length === 0 || !activeThreadRow()) && Date.now() < deadline);
     }
     const context = readHostContext(projects, lastNativeProjectId);
@@ -727,7 +768,9 @@
       lastNativeThreadId = currentThreadId;
     }
     const threadId = currentThreadId || lastNativeThreadId || normalizeThreadId(threadIdFromLocation());
-    const workspacePath = workspaceFromLocation();
+    const workspacePath = workspaceFromLocation()
+      || projects.find((project) => project.id === projectId)?.workspacePath
+      || "";
     const threadRunning = nativeThreadRunning(threadId);
     const payload = {
       language: hostLanguage(),
@@ -791,9 +834,133 @@
     return `/local/${encodeURIComponent(threadId)}`;
   }
 
-  async function openThread(threadId) {
+  function threadRowProjectId(row) {
+    return row?.closest?.("[data-app-action-sidebar-project-list-id]")
+      ?.getAttribute("data-app-action-sidebar-project-list-id")
+      || row?.closest?.("[data-app-action-sidebar-project-id]")
+        ?.getAttribute("data-app-action-sidebar-project-id")
+      || "";
+  }
+
+  function findThreadRowInProject(threadId, projectId) {
+    return Array.from(document.querySelectorAll("[data-app-action-sidebar-thread-id]"))
+      .find((row) => (
+        normalizeThreadId(row.getAttribute("data-app-action-sidebar-thread-id")) === normalizeThreadId(threadId)
+        && threadRowProjectId(row) === projectId
+      )) || null;
+  }
+
+  function projectRowById(projectId) {
+    if (typeof projectId !== "string" || !projectId.trim()) return null;
+    return Array.from(document.querySelectorAll("[data-app-action-sidebar-project-row]"))
+      .find((row) => row.getAttribute("data-app-action-sidebar-project-id") === projectId.trim()) || null;
+  }
+
+  async function waitForRemoteProject(projectId, hostId, workspacePath) {
+    if (!projectId || !hostId || hostId === "local") {
+      throw new Error(hostText(
+        "SSH 远程项目缺少精确的项目或主机标识",
+        "The SSH remote project is missing its exact project or host identity",
+      ));
+    }
+    await ensureProjectRows();
+    const deadline = Date.now() + 8_000;
+    let row = null;
+    while (!row && Date.now() < deadline) {
+      row = projectRowById(projectId);
+      if (!row) await new Promise((resolve) => window.setTimeout(resolve, 80));
+    }
+    if (!row) {
+      throw new Error(hostText(
+        "Codex 中找不到精确的 SSH 远程项目",
+        "The exact SSH remote project is not available in Codex",
+      ));
+    }
+    if (row.getAttribute("data-app-action-sidebar-project-collapsed") === "true") {
+      row.click?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+    }
+    const selectProject = row.querySelector("[data-app-action-sidebar-select-project]");
+    if (!selectProject) {
+      throw new Error(hostText(
+        "Codex 中找不到对应的 SSH 远程项目",
+        "The SSH remote project is not available in Codex",
+      ));
+    }
+    selectProject.click?.();
+    while (Date.now() < deadline) {
+      const [selectedProjectId, metadata] = await Promise.all([
+        selectedNativeProjectId(),
+        readCodexProjectMetadata(),
+      ]);
+      const selectedProject = metadata.get(projectId);
+      if (
+        selectedProjectId === projectId
+        && selectedProject?.projectKind === "remote"
+        && selectedProject.hostId === hostId
+        && (!workspacePath || selectedProject.workspacePath === workspacePath)
+      ) {
+        codexProjectMetadata = metadata;
+        lastNativeProjectId = projectId;
+        return row;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    }
+    throw new Error(hostText(
+      "Codex 没有确认目标 SSH 远程项目和主机",
+      "Codex did not confirm the target SSH remote project and host",
+    ));
+  }
+
+  async function waitForRemoteThreadRow(threadId, projectId) {
+    const deadline = Date.now() + 8_000;
+    let row = findThreadRowInProject(threadId, projectId);
+    while (!row && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+      row = findThreadRowInProject(threadId, projectId);
+    }
+    return row;
+  }
+
+  async function openThread(payload) {
+    const threadId = typeof payload?.threadId === "string" ? payload.threadId : "";
     if (typeof threadId !== "string" || !threadId.trim()) return;
     const normalizedThreadId = normalizeThreadId(threadId);
+    const remoteProject = payload?.codexProjectKind === "remote";
+    if (remoteProject) {
+      try {
+        const projectId = typeof payload?.codexProjectId === "string"
+          ? payload.codexProjectId.trim()
+          : "";
+        const hostId = typeof payload?.codexHostId === "string"
+          ? payload.codexHostId.trim()
+          : "";
+        const workspacePath = typeof payload?.workspacePath === "string"
+          ? payload.workspacePath.trim()
+          : "";
+        await waitForRemoteProject(projectId, hostId, workspacePath);
+        const row = await waitForRemoteThreadRow(normalizedThreadId, projectId);
+        if (!row?.isConnected) {
+          throw new Error(hostText(
+            "目标 SSH 远程项目中找不到该对话",
+            "The conversation is not available in the target SSH remote project",
+          ));
+        }
+        lastNativeThreadId = normalizedThreadId;
+        closeTaskboard(false);
+        row.click?.();
+      } catch (error) {
+        postToFrame({
+          type: "taskboard:thread-open-error",
+          payload: {
+            error: error instanceof Error
+              ? error.message
+              : hostText("无法打开 Codex 对话", "Could not open the Codex conversation"),
+          },
+        });
+      }
+      return;
+    }
     lastNativeThreadId = normalizedThreadId;
     const row = findThreadRow(normalizedThreadId);
     closeTaskboard(false);
@@ -816,10 +983,10 @@
     const entries = bootstrap?.globalStateEntries ?? [];
     const localProjects = entries.find((entry) => entry.key === "local-projects")?.value ?? {};
     return {
-      projects: Object.values(localProjects).filter((project) => (
-        project
-        && typeof project.id === "string"
-        && Array.isArray(project.rootPaths)
+      projects: Object.entries(localProjects).flatMap(([id, project]) => (
+        project && Array.isArray(project.rootPaths)
+          ? [{ ...project, id }]
+          : []
       )),
     };
   }
@@ -834,6 +1001,21 @@
     return typeof targetRoot === "string" && normalizeNativeRootPath(targetRoot)
       ? { targetRoot }
       : null;
+  }
+
+  async function ensureProjectRows() {
+    let section = findProjectsSection();
+    const deadline = Date.now() + 1_200;
+    while (!section && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+      section = findProjectsSection();
+    }
+    if (section?.getAttribute("data-app-action-sidebar-section-collapsed") === "true") {
+      section.querySelector("[data-app-action-sidebar-section-toggle]")?.click();
+    }
+    while (readCodexProjects().length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+    }
   }
 
   async function waitForNativeProject(targetRoot) {
@@ -864,6 +1046,7 @@
     const workspacePath = typeof payload?.workspacePath === "string"
       ? payload.workspacePath.trim()
       : "";
+    const codexProjectKind = payload?.codexProjectKind === "remote" ? "remote" : "local";
     const requestedProjectId = typeof payload?.codexProjectId === "string"
       ? payload.codexProjectId.trim()
       : "";
@@ -884,13 +1067,6 @@
         ));
       }
 
-      const target = await resolveNativeProject(requestedProjectId, workspacePath);
-      if (!target) {
-        throw new Error(hostText(
-          "Codex 中没有映射目标项目或 worktree",
-          "The target project or worktree is not mapped in Codex",
-        ));
-      }
       const previousComposerRoot = Array.from(document.querySelectorAll(
         '[data-codex-composer-root][data-composer-placement="thread"]',
       )).find((candidate) => candidate.getClientRects().length > 0);
@@ -899,18 +1075,39 @@
           ?.querySelector("[data-above-composer-conversation-id]")
           ?.getAttribute("data-above-composer-conversation-id"),
       );
-      const switched = await requestNativeFetch("add-workspace-root-option", {
-        root: target.targetRoot,
-        setActive: true,
-        origin: window.location.origin,
-      });
-      if (switched?.success !== true) {
-        throw new Error(hostText(
-          "Codex 未在限定时间内切换到目标项目或 worktree",
-          "Codex did not switch to the target project or worktree in time",
-        ));
+      let codexHostId = "local";
+      let targetRoot;
+      if (codexProjectKind === "remote") {
+        codexHostId = typeof payload?.codexHostId === "string"
+          ? payload.codexHostId.trim()
+          : "";
+        const codexProjectWorkspacePath = typeof payload?.codexProjectWorkspacePath === "string"
+          ? payload.codexProjectWorkspacePath.trim()
+          : "";
+        await waitForRemoteProject(requestedProjectId, codexHostId, codexProjectWorkspacePath);
+        targetRoot = codexProjectWorkspacePath;
+      } else {
+        const target = await resolveNativeProject(requestedProjectId, workspacePath);
+        if (!target) {
+          throw new Error(hostText(
+            "Codex 中没有映射目标项目或 worktree",
+            "The target project or worktree is not mapped in Codex",
+          ));
+        }
+        targetRoot = target.targetRoot;
+        const switched = await requestNativeFetch("add-workspace-root-option", {
+          root: targetRoot,
+          setActive: true,
+          origin: window.location.origin,
+        });
+        if (switched?.success !== true) {
+          throw new Error(hostText(
+            "Codex 未在限定时间内切换到目标项目或 worktree",
+            "Codex did not switch to the target project or worktree in time",
+          ));
+        }
+        lastNativeProjectId = await waitForNativeProject(targetRoot);
       }
-      lastNativeProjectId = await waitForNativeProject(target.targetRoot);
 
       closeTaskboard(false);
       const focusComposerNonce = crypto.randomUUID();
@@ -925,7 +1122,8 @@
       const started = await requestHostTaskConversationStart({
         taskId,
         previousThreadId,
-        targetRoot: target.targetRoot,
+        codexHostId,
+        targetRoot,
         instruction,
         title,
       });
@@ -954,6 +1152,8 @@
           error: error instanceof Error
             ? error.message
             : hostText("无法创建 Codex 对话", "Could not create the Codex conversation"),
+          ...(typeof error?.threadId === "string" ? { threadId: error.threadId } : {}),
+          ...(error?.uncertain === true ? { uncertain: true } : {}),
         },
       });
     } finally {
@@ -967,8 +1167,11 @@
       operation: payload.operation,
       taskboardProjectId: payload.taskboardProjectId,
       codexProjectId: payload.codexProjectId,
+      codexProjectKind: payload.codexProjectKind,
+      codexHostId: payload.codexHostId,
       projectName: payload.projectName,
       workspacePath: payload.workspacePath,
+      ...(payload.remoteProjects === undefined ? {} : { remoteProjects: payload.remoteProjects }),
       skillPath: payload.skillPath,
       ...(payload.automationId === undefined ? {} : { automationId: payload.automationId }),
       enabledByUser: payload.enabledByUser,
@@ -1091,7 +1294,7 @@
       return;
     }
     if (message.type === "taskboard:open-thread") {
-      void openThread(message.payload?.threadId);
+      void openThread(message.payload);
       return;
     }
     if (message.type === "taskboard:expand-sidebar") {
@@ -1343,7 +1546,9 @@
         ? null
         : window.setTimeout(() => {
           hostRequests.delete(id);
-          reject(hostError("任务面板启动器没有响应", "The Taskboard launcher did not respond"));
+          const error = hostError("任务面板启动器没有响应", "The Taskboard launcher did not respond");
+          if (action === "start-task-conversation") error.uncertain = true;
+          reject(error);
         }, timeoutMs);
       hostRequests.set(id, { resolve, reject, timeout });
       try {
@@ -1374,6 +1579,7 @@
   function requestHostTaskConversationStart({
     taskId,
     previousThreadId,
+    codexHostId,
     targetRoot,
     instruction,
     title,
@@ -1381,10 +1587,11 @@
     return requestHost("start-task-conversation", {
       taskId,
       previousThreadId,
+      codexHostId,
       targetRoot,
       instruction,
       title,
-    }, null);
+    }, TASK_CONVERSATION_REQUEST_TIMEOUT_MS);
   }
 
   function frameMatchesTaskboardUrl(taskboardUrl) {
@@ -1407,9 +1614,14 @@
     if (pending.timeout !== null) window.clearTimeout(pending.timeout);
     hostRequests.delete(response.id);
     if (response.ok) pending.resolve(response);
-    else pending.reject(response.error
-      ? new Error(response.error)
-      : hostError("任务面板服务启动失败", "The Taskboard service failed to start"));
+    else {
+      const error = response.error
+        ? new Error(response.error)
+        : hostError("任务面板服务启动失败", "The Taskboard service failed to start");
+      if (typeof response.threadId === "string") error.threadId = response.threadId;
+      if (response.uncertain === true) error.uncertain = true;
+      pending.reject(error);
+    }
   }
 
   function onHostBridgeMessage(event) {
