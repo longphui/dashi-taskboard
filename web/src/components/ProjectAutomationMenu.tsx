@@ -11,6 +11,7 @@ import { TaskboardIcon } from "./TaskboardIcon";
 import { useTaskboardI18n } from "../i18n";
 
 type AutomationStatus = "ACTIVE" | "PAUSED";
+type AutomationDisplayState = "disabled" | "waiting" | "running" | "quota-paused";
 type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
 type IntervalMinutes = 5 | 10 | 15 | 30 | 60;
 
@@ -75,17 +76,26 @@ export function ProjectAutomationMenu({
   const [draft, setDraft] = useState<AutomationOptions>(DEFAULT_OPTIONS);
   const status = automation?.status ?? "PAUSED";
   const quota = automation?.quota;
-  const stateLabel = !automation?.enabledByUser
-    ? text("已暂停", "Paused")
-    : automation.quotaAware && quota?.state === "blocked"
+  const displayState: AutomationDisplayState = !automation?.enabledByUser
+    ? "disabled"
+    : automation.quotaAware && (!quota || quota.state !== "available")
+      ? "quota-paused"
+      : status === "ACTIVE"
+        ? "running"
+        : "waiting";
+  const stateLabel = displayState === "disabled"
+    ? text("未启用", "Disabled")
+    : displayState === "quota-paused"
       ? text("额度暂停", "Paused by quota")
-      : automation.quotaAware && quota?.state === "unavailable"
-        ? text("额度不可用", "Quota unavailable")
-        : automation.quotaAware && (!quota || quota.state === "unknown")
-          ? text("额度未知", "Quota unknown")
-          : status === "ACTIVE"
-            ? text("运行中", "Running")
-            : text("已暂停", "Paused");
+      : displayState === "running"
+        ? text("自动认领中", "Auto-claiming")
+        : text("等待可认领任务", "Waiting for eligible tasks");
+  const stateClass = displayState === "running"
+    ? "is-active"
+    : displayState === "waiting"
+      ? "is-waiting"
+      : "is-paused";
+  const autoClaimEnabled = displayState === "waiting" || displayState === "running";
   const disabled = pending || Boolean(unavailableReason);
 
   useEffect(() => {
@@ -155,9 +165,7 @@ export function ProjectAutomationMenu({
     >
       <div className="project-automation-menu-heading">
         <strong>{text("自动认领待办", "Auto-claim tasks")}</strong>
-        <span className={status === "ACTIVE" ? "is-active" : "is-paused"}>
-          {stateLabel}
-        </span>
+        <span className={stateClass}>{stateLabel}</span>
       </div>
       <div className="project-automation-switch">
         <span>{text("自动认领开关", "Auto-claim")}</span>
@@ -269,16 +277,12 @@ export function ProjectAutomationMenu({
       <button
         ref={triggerRef}
         type="button"
-        className={`project-automation-trigger no-drag ${status === "ACTIVE" ? "is-active" : "is-paused"}`}
-        aria-label={status === "ACTIVE"
-          ? text("自动认领中", "Auto-claiming")
-          : text("自动化", "Automation")}
+        className={`project-automation-trigger no-drag ${stateClass}`}
+        aria-label={stateLabel}
         aria-busy={pending}
         aria-haspopup="dialog"
         aria-expanded={open}
-        title={status === "ACTIVE"
-          ? text("自动认领中", "Auto-claiming")
-          : text("自动化", "Automation")}
+        title={stateLabel}
         onClick={() => {
           if (!open) {
             setPosition((current) => ({ ...current, ready: false }));
@@ -287,10 +291,8 @@ export function ProjectAutomationMenu({
           setOpen((current) => !current);
         }}
       >
-        <TaskboardIcon name={status === "ACTIVE" ? "automationPause" : "automationPlay"} />
-        <span>{status === "ACTIVE"
-          ? text("自动认领中", "Auto-claiming")
-          : text("自动化", "Automation")}</span>
+        <TaskboardIcon name={autoClaimEnabled ? "automationPause" : "automationPlay"} />
+        <span>{stateLabel}</span>
       </button>
       {menu}
     </>

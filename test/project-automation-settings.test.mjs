@@ -98,11 +98,11 @@ test("global tasks resolve thread metadata from the active Codex project", () =>
 });
 
 test("the project navigation automation menu owns the icon, fields, and accessible popover", () => {
-  assert.match(menuSource, /status === "ACTIVE" \? "automationPause" : "automationPlay"/);
+  assert.match(menuSource, /autoClaimEnabled \? "automationPause" : "automationPlay"/);
   assert.doesNotMatch(menuSource, /statusStarted|statusTodo/);
   assert.match(menuSource, /aria-busy=\{pending/);
   assert.match(menuSource, /自动认领/);
-  assert.match(menuSource, /aria-label=\{status === "ACTIVE"\s*\? text\("自动认领中", "Auto-claiming"\)\s*: text\("自动化", "Automation"\)\}/);
+  assert.match(menuSource, /aria-label=\{stateLabel\}/);
   assert.doesNotMatch(menuSource, /已开启自动认领|自动认领未开启/);
   assert.match(menuSource, /自动认领开关/);
   assert.match(menuSource, /5, 10, 15, 30, 60/);

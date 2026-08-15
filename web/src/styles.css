@@ -1217,6 +1217,11 @@ kbd {
   color: var(--success);
 }
 
+.project-automation-trigger.is-waiting,
+.project-automation-menu .is-waiting {
+  color: var(--accent);
+}
+
 .project-automation-trigger.is-paused,
 .project-automation-menu .is-paused {
   color: var(--text-tertiary);
@@ -9132,6 +9137,12 @@ kbd {
   border-color: color-mix(in srgb, #00a558 14%, var(--border));
   background: rgba(0, 165, 88, 0.1);
   color: #00a558;
+}
+
+.project-automation-trigger.is-waiting {
+  border-color: color-mix(in srgb, var(--accent) 14%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .project-automation-trigger.is-paused {
