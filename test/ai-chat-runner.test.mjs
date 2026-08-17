@@ -33,6 +33,42 @@ test("normalized item events retain a bounded public item id", () => {
   assert.equal(normalized.data.itemId, itemId.slice(0, 65_536));
 });
 
+test("completed item errors are warnings while failed item errors remain errors", () => {
+  const completed = normalizeCodexEvent({
+    type: "item.completed",
+    item: {
+      id: "notice",
+      type: "error",
+      status: "completed",
+      message: "Skill descriptions were shortened",
+    },
+  });
+  const failed = normalizeCodexEvent({
+    type: "item.completed",
+    item: {
+      id: "failure",
+      type: "error",
+      status: "failed",
+      message: "Tool failed",
+    },
+  });
+
+  assert.deepEqual(completed, {
+    kind: "event",
+    type: "error",
+    role: "activity",
+    content: "Skill descriptions were shortened",
+    data: { status: "warning", itemId: "notice" },
+  });
+  assert.deepEqual(failed, {
+    kind: "event",
+    type: "error",
+    role: "error",
+    content: "Tool failed",
+    data: { status: "failed", itemId: "failure" },
+  });
+});
+
 async function createFixture() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-ai-runner-"));
   const workspacePath = path.join(directory, "workspace");
@@ -111,6 +147,9 @@ if (args[0] === "app-server") {
     emit({type:"item.completed",item:{type:"reasoning",text:"SECRET REASONING"}});
     emit({type:"item.completed",item:{type:"agent_message",text:"Visible answer"}});
     emit({type:"item.completed",item:{type:"command_execution",command:"npm test",status:"completed",exit_code:0,aggregated_output:"ok"}});
+    if (prompt.includes("LARGE_COMMAND_OUTPUT")) {
+      emit({type:"item.completed",item:{type:"command_execution",command:"large output",status:"completed",exit_code:0,aggregated_output:"x".repeat(1_048_577)}});
+    }
     if (prompt.includes("TURN_FAILED_ZERO")) {
       emit({type:"turn.failed",error:{message:"Protocol turn failed"}});
       return;
@@ -118,6 +157,9 @@ if (args[0] === "app-server") {
     if (prompt.includes("ROOT_ERROR_ZERO")) {
       emit({type:"error",message:"Protocol root error"});
       return;
+    }
+    if (prompt.includes("WARNING_THEN_COMPLETED")) {
+      emit({type:"error",message:"Skill descriptions were shortened"});
     }
     if (prompt.includes("NO_TERMINAL")) return;
     if (prompt.includes("ITEM_ERROR")) {
@@ -351,12 +393,63 @@ test("protocol terminal events determine run success and item errors remain non-
       ["ROOT_ERROR_ZERO", "failed"],
       ["NO_TERMINAL", "failed"],
       ["ITEM_ERROR", "completed"],
+      ["WARNING_THEN_COMPLETED", "completed"],
     ]) {
       const thread = await fixture.service.createThread({ projectId: "project" });
       const run = await fixture.service.startTurn(thread.id, { message });
       await waitFor(() => fixture.service.getRun(run.id).status !== "running");
       assert.equal(fixture.service.getRun(run.id).status, expectedStatus, message);
     }
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a root Codex error remains the run diagnostic when completion never arrives", async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.service.createThread({ projectId: "project" });
+    const run = await fixture.service.startTurn(thread.id, { message: "ROOT_ERROR_ZERO" });
+    await waitFor(() => fixture.service.getRun(run.id)?.status !== "running");
+
+    const finished = fixture.service.getRun(run.id);
+    assert.equal(finished.status, "failed");
+    assert.equal(finished.error, "Protocol root error");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a root Codex error preceding completion is recorded as a warning", async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.service.createThread({ projectId: "project" });
+    const run = await fixture.service.startTurn(thread.id, { message: "WARNING_THEN_COMPLETED" });
+    await waitFor(() => fixture.service.getRun(run.id)?.status !== "running");
+
+    const warning = fixture.service.getThreadSnapshot(thread.id).events.find(
+      (event) => event.type === "error" && event.content === "Skill descriptions were shortened",
+    );
+    assert.equal(fixture.service.getRun(run.id).status, "completed");
+    assert.equal(warning?.role, "activity");
+    assert.equal(warning?.data.status, "warning");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a Codex command event slightly over one MiB completes and keeps only bounded output", async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.service.createThread({ projectId: "project" });
+    const run = await fixture.service.startTurn(thread.id, { message: "LARGE_COMMAND_OUTPUT" });
+    await waitFor(() => fixture.service.getRun(run.id)?.status !== "running");
+
+    assert.equal(fixture.service.getRun(run.id).status, "completed");
+    const largeOutputEvent = fixture.service.getThreadSnapshot(thread.id).events.find(
+      (event) => event.type === "command_execution" && event.content === "large output",
+    );
+    assert.equal(largeOutputEvent.data.output.length, 65_536);
   } finally {
     await fixture.close();
   }

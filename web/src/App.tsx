@@ -63,6 +63,7 @@ import {
 } from "./actors";
 import { BoardColumn } from "./components/BoardColumn";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
+import { BoardCardDisplayMenu } from "./components/BoardCardDisplayMenu";
 import { DashboardView } from "./components/DashboardView";
 import { IssueListView } from "./components/IssueListView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
@@ -146,6 +147,7 @@ type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
+type BoardCardDisplay = { cover: boolean; body: boolean };
 type ActionError = string | readonly [string, string];
 type ProjectLoadError = {
   source: "projects";
@@ -312,6 +314,7 @@ const PROJECT_VIEW_KEY_PREFIX = "taskboard.project-view.v1.";
 const DEVICE_WORKSPACE_PATHS_KEY = "taskboard.deviceWorkspacePaths.v1";
 const PROJECT_CODEX_IDENTITIES_KEY = "taskboard.projectCodexIdentities.v1";
 const PROJECT_AUTOMATIONS_KEY = "taskboard.projectAutomations.v1";
+const BOARD_CARD_DISPLAY_KEY = "taskboard.board-card-display.v1";
 const ISSUE_READ_KEY_PREFIX = "taskboard.issue-read.v1";
 const FIRST_USE_COMPLETE_KEY = "taskboard.first-use-complete.v1";
 const DEFAULT_AUTOMATION_OPTIONS = {
@@ -339,6 +342,18 @@ function readProjectBoardView(projectId: string): BoardView {
   return view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
     ? view
     : "issues";
+}
+
+function readBoardCardDisplay(): BoardCardDisplay {
+  try {
+    const value = JSON.parse(taskboardStorage.getItem(BOARD_CARD_DISPLAY_KEY) ?? "{}");
+    return {
+      cover: value.cover !== false,
+      body: value.body === true,
+    };
+  } catch {
+    return { cover: true, body: false };
+  }
 }
 
 function readRecentProjectIds(): string[] {
@@ -720,6 +735,7 @@ export function App() {
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState(readTaskFilters);
   const [boardView, setBoardView] = useState<BoardView>(() => readProjectBoardView(initialProjectId));
+  const [boardCardDisplay, setBoardCardDisplay] = useState<BoardCardDisplay>(readBoardCardDisplay);
   const [dashboardSummaryAnimatedProjectId, setDashboardSummaryAnimatedProjectId] = useState<string | null>(null);
   const [ganttZoom, setGanttZoom] = useState<GanttZoom>("week");
   const [ganttHideCompleted, setGanttHideCompleted] = useState(false);
@@ -1002,8 +1018,9 @@ export function App() {
       skillPath: manageTaskboardSkillPath,
     };
   }, [automationProjectContext, hostContext, manageTaskboardSkillPath, selectedProject]);
+  const referenceTasks = useMemo(() => [...tasks, ...archivedTasks], [archivedTasks, tasks]);
   const detailTask = detailTaskIdentifier
-    ? tasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
+    ? referenceTasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
     : null;
   const detailTaskId = detailTask?.id ?? null;
   const contextMenuTask = contextMenu
@@ -2111,6 +2128,11 @@ export function App() {
     }
   }
 
+  function updateBoardCardDisplay(value: BoardCardDisplay) {
+    setBoardCardDisplay(value);
+    taskboardStorage.setItem(BOARD_CARD_DISPLAY_KEY, JSON.stringify(value));
+  }
+
   async function saveEditor(
     draft: TaskDraft,
     attachments: File[],
@@ -2143,10 +2165,10 @@ export function App() {
     if (creating && (attachments.length > 0 || inlineImages.length > 0)) {
       const [results, inlineResults] = await Promise.all([
           Promise.allSettled(
-            attachments.map((file) => uploadAttachment(saved.id, file)),
+            attachments.map((file) => uploadAttachment(saved.id, file, "attachment")),
           ),
           Promise.allSettled(
-            inlineImages.map((image) => uploadAttachment(saved.id, image.file)),
+            inlineImages.map((image) => uploadAttachment(saved.id, image.file, "inline")),
           ),
       ]);
       failedAttachments = results.filter((result) => result.status === "rejected").length;
@@ -3525,6 +3547,13 @@ export function App() {
               onChange={setFilters}
             />
             {boardView === "issues" && (
+              <BoardCardDisplayMenu
+                cover={boardCardDisplay.cover}
+                body={boardCardDisplay.body}
+                onChange={updateBoardCardDisplay}
+              />
+            )}
+            {boardView === "issues" && (
               <button
                 className={`other-tasks-trigger${otherTasksOpen ? " is-open" : ""}`}
                 type="button"
@@ -3567,6 +3596,7 @@ export function App() {
             key={detailTask.id}
             task={detailTask}
             tasks={tasks}
+            referenceTasks={referenceTasks}
             currentUser={currentUser}
             availableLabels={availableLabels}
             developmentScan={developmentScan}
@@ -3713,6 +3743,8 @@ export function App() {
                         contextMenuTaskId={contextMenu?.taskId ?? null}
                         availableLabels={availableLabels}
                         currentUser={currentUser}
+                        showCover={boardCardDisplay.cover}
+                        showBody={boardCardDisplay.body}
                         createEnabled={!isJiraProject}
                         onCreateLabel={persistProjectLabel}
                         onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
@@ -3746,6 +3778,8 @@ export function App() {
                     contextMenuTaskId={contextMenu?.taskId ?? null}
                     availableLabels={availableLabels}
                     currentUser={currentUser}
+                    showCover={boardCardDisplay.cover}
+                    showBody={boardCardDisplay.body}
                     onCreateLabel={persistProjectLabel}
                     restoringTaskId={restoringTaskId}
                     deletingTaskId={deletingArchivedTaskId}
@@ -3986,6 +4020,7 @@ export function App() {
           key={editor.task?.id ?? `new-${selectedProjectId}-${editor.status}`}
           task={editor.task}
           tasks={tasks.filter((task) => task.projectId === selectedProjectId)}
+          referenceTasks={referenceTasks.filter((task) => task.projectId === selectedProjectId)}
           initialStatus={editor.status}
           initialDraft={editor.task || newTaskDraft?.projectId !== selectedProjectId
             ? null

@@ -509,7 +509,15 @@ function parseAttachmentHeaders(request) {
       "Attachment Content-Type is invalid",
     );
   }
-  return { filename, contentType };
+  const kind = request.headers.get("x-taskboard-attachment-kind");
+  if (kind !== "inline" && kind !== "attachment") {
+    throw new ApiError(
+      400,
+      "INVALID_ATTACHMENT_KIND",
+      "X-Taskboard-Attachment-Kind must be inline or attachment",
+    );
+  }
+  return { filename, contentType, kind };
 }
 
 function projectFromRow(row) {
@@ -784,6 +792,7 @@ function attachmentFromRow(row) {
     id: row.id,
     taskId: row.task_id,
     commentId: row.comment_id,
+    kind: row.kind,
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -2552,12 +2561,13 @@ async function uploadAttachment(env, ownerType, ownerId, request) {
   try {
     await env.DB.prepare(`
       INSERT INTO attachments (
-        id, task_id, comment_id, filename, content_type, size, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        id, task_id, comment_id, kind, filename, content_type, size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       id,
       taskId,
       commentId,
+      metadata.kind,
       metadata.filename,
       metadata.contentType,
       body.byteLength,

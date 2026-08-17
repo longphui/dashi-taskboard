@@ -470,9 +470,11 @@ function MarkdownPre({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
 export function MarkdownDocument({
   value,
   onLinkClick,
+  renderLink,
 }: {
   value: string;
   onLinkClick?: (event: MouseEvent<HTMLAnchorElement>, href?: string) => void;
+  renderLink?: (href: string | undefined, children: ReactNode) => ReactNode | null;
 }) {
   return (
     <div className="issue-description-document">
@@ -480,15 +482,22 @@ export function MarkdownDocument({
         remarkPlugins={[remarkGfm, remarkStripMarkdownComments, remarkBreaks]}
         urlTransform={(url) => defaultUrlTransform(resolvePersistedAttachmentUrl(url))}
         components={{
-          a: ({ node: _node, href, ...props }) => (
-            <a
-              {...props}
-              href={href}
-              target="_blank"
-              rel="noreferrer"
-              onClick={(event) => onLinkClick?.(event, href)}
-            />
-          ),
+          a: ({ node: _node, href, children, className, ...props }) => {
+            const renderedLink = renderLink?.(href, children);
+            const isRenderedLink = renderedLink !== null && renderedLink !== undefined;
+            return (
+              <a
+                {...props}
+                className={[className, isRenderedLink ? "issue-reference-link" : ""].filter(Boolean).join(" ") || undefined}
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(event) => onLinkClick?.(event, href)}
+              >
+                {isRenderedLink ? renderedLink : children}
+              </a>
+            );
+          },
           pre: MarkdownPre,
         }}
       >

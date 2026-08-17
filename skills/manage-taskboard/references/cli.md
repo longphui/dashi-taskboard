@@ -161,8 +161,8 @@ Issue descriptions and comments may contain inline images at exact positions in 
 Upload a local file to a task or a comment. Provide exactly one of `--task` or `--comment`:
 
 ```bash
-taskctl attachment upload --task TASK_ID --file PATH [--content-type TYPE] [--json]
-taskctl attachment upload --comment COMMENT_ID --file PATH [--content-type TYPE] [--json]
+taskctl attachment upload --task TASK_ID --file PATH [--content-type TYPE] [--kind inline|attachment] [--json]
+taskctl attachment upload --comment COMMENT_ID --file PATH [--content-type TYPE] [--kind inline|attachment] [--json]
 ```
 
 The command sends the file bytes to:
@@ -170,7 +170,7 @@ The command sends the file bytes to:
 - `POST /api/tasks/:id/attachments`, or
 - `POST /api/comments/:id/attachments`
 
-with the same headers as the web UI (`Content-Type`, `X-Taskboard-Filename`). If `--content-type` is omitted, the CLI guesses from the file extension and falls back to `application/octet-stream`.
+with the same headers as the web UI (`Content-Type`, `X-Taskboard-Filename`, `X-Taskboard-Attachment-Kind`). If `--content-type` is omitted, the CLI guesses from the file extension and falls back to `application/octet-stream`. If `--kind` is omitted, images use `inline` and other files use `attachment`. Use `--kind attachment` for an image that must appear in the attachment list. An inline upload returns the attachment id; use that id in the task description or comment Markdown at the required position.
 
 Download an attachment to an explicit local path:
 

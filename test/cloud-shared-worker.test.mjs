@@ -483,6 +483,7 @@ test("R2 attachment upload, download, delete, and D1 failure compensation form o
     headers: {
       "content-type": "text/plain",
       "x-taskboard-filename": encodeURIComponent("evidence.txt"),
+      "x-taskboard-attachment-kind": "attachment",
     },
     body: "attachment body",
   });
@@ -511,6 +512,7 @@ test("R2 attachment upload, download, delete, and D1 failure compensation form o
     headers: {
       "content-type": "text/plain",
       "x-taskboard-filename": encodeURIComponent("fail.txt"),
+      "x-taskboard-attachment-kind": "attachment",
     },
     body: "must be compensated",
   });
@@ -529,6 +531,7 @@ test("permanent task deletion requires archiving and cleans D1 and R2", async ()
     headers: {
       "content-type": "text/plain",
       "x-taskboard-filename": "evidence.txt",
+      "x-taskboard-attachment-kind": "attachment",
     },
     body: "attachment",
   });
@@ -547,6 +550,7 @@ test("permanent task deletion requires archiving and cleans D1 and R2", async ()
       headers: {
         "content-type": "text/plain",
         "x-taskboard-filename": "comment-evidence.txt",
+        "x-taskboard-attachment-kind": "attachment",
       },
       body: "comment attachment",
     },
@@ -841,6 +845,7 @@ test("workflow conflicts and comment attachment cleanup preserve shared-state bo
       headers: {
         "content-type": "text/plain",
         "x-taskboard-filename": encodeURIComponent("comment.txt"),
+        "x-taskboard-attachment-kind": "attachment",
       },
       body: "comment attachment",
     },

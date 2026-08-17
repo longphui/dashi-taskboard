@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::Engine;
 #[cfg(target_os = "macos")]
 use dispatch2::{run_on_main, MainThreadBound};
+use futures_util::StreamExt;
+use minisign_verify::{PublicKey, Signature};
 #[cfg(target_os = "macos")]
 use objc2::{
     define_class, msg_send,
@@ -10,9 +13,12 @@ use objc2::{
     sel, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSAlert, NSApplication, NSButton};
+use objc2_app_kit::{
+    NSAlert, NSApplication, NSButton, NSProgressIndicator, NSProgressIndicatorStyle,
+};
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSObject, NSString};
+use objc2_foundation::{NSObject, NSSize, NSString};
+use reqwest::header::{HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
@@ -20,6 +26,7 @@ use std::cell::RefCell;
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::{
     fs::{self, File, OpenOptions},
+    future::{poll_fn, Future},
     io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -28,6 +35,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    task::Poll,
     thread,
     time::{Duration, Instant},
 };
@@ -98,6 +106,7 @@ struct LauncherState {
 #[cfg(target_os = "macos")]
 struct UpdateDialogTargetIvars {
     response: RefCell<Option<std::sync::mpsc::Sender<bool>>>,
+    cancel: RefCell<Option<(tauri::async_runtime::Sender<()>, Arc<AtomicBool>)>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -120,6 +129,14 @@ define_class!(
         fn defer_update(&self, _sender: &AnyObject) {
             self.respond(false);
         }
+
+        #[unsafe(method(cancelUpdate:))]
+        fn cancel_update(&self, _sender: &AnyObject) {
+            if let Some((cancel, cancel_requested)) = self.ivars().cancel.borrow_mut().take() {
+                cancel_requested.store(true, Ordering::SeqCst);
+                let _ = cancel.try_send(());
+            }
+        }
     }
 );
 
@@ -128,6 +145,7 @@ impl UpdateDialogTarget {
     fn new(mtm: MainThreadMarker, response: std::sync::mpsc::Sender<bool>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(UpdateDialogTargetIvars {
             response: RefCell::new(Some(response)),
+            cancel: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -137,14 +155,27 @@ impl UpdateDialogTarget {
             let _ = response.send(accepted);
         }
     }
+
+    fn set_cancel(
+        &self,
+        cancel: tauri::async_runtime::Sender<()>,
+        cancel_requested: Arc<AtomicBool>,
+    ) {
+        *self.ivars().cancel.borrow_mut() = Some((cancel, cancel_requested));
+    }
+
+    fn clear_cancel(&self) {
+        self.ivars().cancel.borrow_mut().take();
+    }
 }
 
 #[cfg(target_os = "macos")]
 struct NativeUpdateDialog {
     alert: Retained<NSAlert>,
+    progress_indicator: Retained<NSProgressIndicator>,
     install_button: Retained<NSButton>,
     defer_button: Retained<NSButton>,
-    _target: Retained<UpdateDialogTarget>,
+    target: Retained<UpdateDialogTarget>,
 }
 
 #[cfg(target_os = "macos")]
@@ -161,6 +192,13 @@ impl UpdateDialog {
         let dialog = run_on_main(move |mtm| {
             let alert = NSAlert::new(mtm);
             let target = UpdateDialogTarget::new(mtm, response);
+            let progress_indicator = NSProgressIndicator::new(mtm);
+            progress_indicator.setStyle(NSProgressIndicatorStyle::Bar);
+            progress_indicator.setMinValue(0.0);
+            progress_indicator.setMaxValue(100.0);
+            progress_indicator.setFrameSize(NSSize::new(280.0, 20.0));
+            progress_indicator.sizeToFit();
+            progress_indicator.setDisplayedWhenStopped(true);
             alert.setMessageText(&NSString::from_str("Codex Taskboard 更新"));
             alert.setInformativeText(&NSString::from_str(&message));
             let install_button = alert.addButtonWithTitle(&NSString::from_str("立即更新"));
@@ -180,9 +218,10 @@ impl UpdateDialog {
                 native: Arc::new(MainThreadBound::new(
                     NativeUpdateDialog {
                         alert,
+                        progress_indicator,
                         install_button,
                         defer_button,
-                        _target: target,
+                        target,
                     },
                     mtm,
                 )),
@@ -196,7 +235,39 @@ impl UpdateDialog {
         }
     }
 
-    fn show_progress(&self, message: &str) {
+    fn show_progress(
+        &self,
+        message: &str,
+        cancel: tauri::async_runtime::Sender<()>,
+        cancel_requested: Arc<AtomicBool>,
+    ) {
+        let native = Arc::clone(&self.native);
+        let message = message.to_owned();
+        run_on_main(move |mtm| {
+            let native = native.get(mtm);
+            native.target.set_cancel(cancel, cancel_requested);
+            native
+                .alert
+                .setInformativeText(&NSString::from_str(&message));
+            native.progress_indicator.setIndeterminate(false);
+            native.progress_indicator.setDoubleValue(0.0);
+            native
+                .alert
+                .setAccessoryView(Some(&native.progress_indicator));
+            native.install_button.setHidden(true);
+            native.defer_button.setTitle(&NSString::from_str("取消"));
+            unsafe {
+                native.defer_button.setAction(Some(sel!(cancelUpdate:)));
+            }
+            native.defer_button.setEnabled(true);
+            native.defer_button.setHidden(false);
+            native.alert.layout();
+            native.progress_indicator.setNeedsDisplay(true);
+            native.progress_indicator.displayIfNeeded();
+        });
+    }
+
+    fn set_progress(&self, message: &str, progress: Option<u64>, cancellable: bool) {
         let native = Arc::clone(&self.native);
         let message = message.to_owned();
         run_on_main(move |mtm| {
@@ -204,26 +275,27 @@ impl UpdateDialog {
             native
                 .alert
                 .setInformativeText(&NSString::from_str(&message));
-            native.install_button.setHidden(true);
-            native.defer_button.setHidden(true);
+            native.progress_indicator.setIndeterminate(false);
+            if let Some(progress) = progress {
+                native.progress_indicator.setDoubleValue(progress as f64);
+            }
+            if !cancellable {
+                native.target.clear_cancel();
+                native.defer_button.setEnabled(false);
+                native.defer_button.setHidden(true);
+            }
             native.alert.layout();
-        });
-    }
-
-    fn set_message(&self, message: &str) {
-        let native = Arc::clone(&self.native);
-        let message = message.to_owned();
-        run_on_main(move |mtm| {
-            let alert = &native.get(mtm).alert;
-            alert.setInformativeText(&NSString::from_str(&message));
-            alert.layout();
+            native.progress_indicator.setNeedsDisplay(true);
+            native.progress_indicator.displayIfNeeded();
         });
     }
 
     fn close(&self) {
         let native = Arc::clone(&self.native);
         run_on_main(move |mtm| {
-            native.get(mtm).alert.window().close();
+            let native = native.get(mtm);
+            native.target.clear_cancel();
+            native.alert.window().close();
         });
     }
 }
@@ -238,9 +310,15 @@ impl UpdateDialog {
         None
     }
 
-    fn show_progress(&self, _message: &str) {}
+    fn show_progress(
+        &self,
+        _message: &str,
+        _cancel: tauri::async_runtime::Sender<()>,
+        _cancel_requested: Arc<AtomicBool>,
+    ) {
+    }
 
-    fn set_message(&self, _message: &str) {}
+    fn set_progress(&self, _message: &str, _progress: Option<u64>, _cancellable: bool) {}
 
     fn close(&self) {}
 }
@@ -1084,6 +1162,96 @@ async fn check_for_startup_update(
     Ok(update)
 }
 
+async fn download_update<C: FnMut(usize, Option<u64>), D: FnOnce()>(
+    app: &AppHandle,
+    update: &Update,
+    cancel_requested: &AtomicBool,
+    mut on_chunk: C,
+    on_download_finish: D,
+) -> Result<Option<Vec<u8>>, String> {
+    let pubkey = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|value| value.get("pubkey"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Updater public key is unavailable")?;
+    let mut headers = update.headers.clone();
+    if !headers.contains_key(ACCEPT) {
+        headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
+    }
+    let mut request = reqwest::Client::builder().user_agent("tauri-plugin-updater/2.10.1");
+    if let Some(timeout) = update.timeout {
+        request = request.timeout(timeout);
+    }
+    if update.no_proxy {
+        request = request.no_proxy();
+    } else if let Some(proxy) = &update.proxy {
+        request =
+            request.proxy(reqwest::Proxy::all(proxy.as_str()).map_err(|error| error.to_string())?);
+    }
+    let response = request
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(update.download_url.clone())
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Download request failed with status: {}",
+            response.status()
+        ));
+    }
+    let content_length = response
+        .headers()
+        .get("Content-Length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let mut buffer = Vec::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        on_chunk(chunk.len(), content_length);
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    if cancel_requested.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    on_download_finish();
+    if cancel_requested.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let pubkey = base64::engine::general_purpose::STANDARD
+        .decode(pubkey)
+        .map_err(|error| error.to_string())?;
+    let pubkey = std::str::from_utf8(&pubkey).map_err(|error| error.to_string())?;
+    let pubkey = PublicKey::decode(pubkey).map_err(|error| error.to_string())?;
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&update.signature)
+        .map_err(|error| error.to_string())?;
+    let signature = std::str::from_utf8(&signature).map_err(|error| error.to_string())?;
+    let signature = Signature::decode(signature).map_err(|error| error.to_string())?;
+    pubkey
+        .verify(&buffer, &signature, true)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(buffer))
+}
+
 async fn install_update(
     app: &AppHandle,
     state: &Arc<LauncherState>,
@@ -1096,7 +1264,13 @@ async fn install_update(
         snapshot.update_message = format!("正在下载 {update_version}…");
         snapshot.update_available = false;
     });
-    update_dialog.show_progress(&snapshot.update_message);
+    let (cancel, mut cancel_receiver) = tauri::async_runtime::channel(1);
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    update_dialog.show_progress(
+        &snapshot.update_message,
+        cancel,
+        Arc::clone(&cancel_requested),
+    );
     let progress_app = app.clone();
     let progress_state = Arc::clone(state);
     let progress_version = update_version.clone();
@@ -1105,34 +1279,72 @@ async fn install_update(
     let finish_state = Arc::clone(state);
     let finish_dialog = update_dialog.clone();
     let mut downloaded = 0_u64;
-    let bytes = match update
-        .download(
+    let download_result = {
+        let download = download_update(
+            app,
+            &update,
+            &cancel_requested,
             move |chunk_length, content_length| {
                 downloaded = downloaded.saturating_add(chunk_length as u64);
+                let progress = content_length.filter(|total| *total > 0).map(|total| {
+                    downloaded
+                        .saturating_mul(100)
+                        .saturating_div(total)
+                        .min(100)
+                });
                 let snapshot = update_snapshot(&progress_app, &progress_state, |snapshot| {
-                    snapshot.update_message = match content_length.filter(|total| *total > 0) {
-                        Some(total) => format!(
-                            "正在下载 {progress_version} · {}%",
-                            downloaded
-                                .saturating_mul(100)
-                                .saturating_div(total)
-                                .min(100)
-                        ),
+                    snapshot.update_message = match progress {
+                        Some(progress) => {
+                            format!("正在下载 {progress_version} · {progress}%")
+                        }
                         None => format!("正在下载 {progress_version}…"),
                     };
                 });
-                progress_dialog.set_message(&snapshot.update_message);
+                progress_dialog.set_progress(&snapshot.update_message, progress, true);
             },
             move || {
                 let snapshot = update_snapshot(&finish_app, &finish_state, |snapshot| {
                     snapshot.update_message = "正在验证更新…".into();
                 });
-                finish_dialog.set_message(&snapshot.update_message);
+                finish_dialog.set_progress(&snapshot.update_message, Some(100), false);
             },
-        )
+        );
+        let mut download = std::pin::pin!(download);
+        poll_fn(|cx| {
+            if cancel_requested.load(Ordering::SeqCst)
+                || matches!(cancel_receiver.poll_recv(cx), Poll::Ready(Some(())))
+            {
+                return Poll::Ready(Ok(None));
+            }
+            match download.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    if cancel_requested.load(Ordering::SeqCst)
+                        || matches!(cancel_receiver.poll_recv(cx), Poll::Ready(Some(())))
+                    {
+                        Poll::Ready(Ok(None))
+                    } else {
+                        Poll::Ready(result)
+                    }
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        })
         .await
-    {
-        Ok(bytes) => bytes,
+    };
+    let bytes = match download_result {
+        Ok(None) => {
+            append_log(
+                state,
+                &format!("Update {update_version} download cancelled by user"),
+            );
+            state.update_in_progress.store(false, Ordering::SeqCst);
+            update_snapshot(app, state, |snapshot| {
+                snapshot.update_message = "更新已取消。".into();
+                snapshot.update_available = true;
+            });
+            return Ok(());
+        }
+        Ok(Some(bytes)) => bytes,
         Err(error) => {
             append_log(state, &format!("Update download failed: {error}"));
             state.update_in_progress.store(false, Ordering::SeqCst);
@@ -1140,14 +1352,14 @@ async fn install_update(
                 snapshot.update_message = format!("更新下载或签名验证失败：{error}");
                 snapshot.update_available = true;
             });
-            return Err(error.to_string());
+            return Err(error);
         }
     };
 
     let snapshot = update_snapshot(app, state, |snapshot| {
         snapshot.update_message = "正在安装更新…".into();
     });
-    update_dialog.set_message(&snapshot.update_message);
+    update_dialog.set_progress(&snapshot.update_message, None, false);
     {
         let _lifecycle = state.lifecycle.lock().unwrap();
         if state.intentional_stop.load(Ordering::SeqCst) {
@@ -1193,7 +1405,7 @@ async fn install_update(
     let snapshot = update_snapshot(app, state, |snapshot| {
         snapshot.update_message = "正在重启…".into();
     });
-    update_dialog.set_message(&snapshot.update_message);
+    update_dialog.set_progress(&snapshot.update_message, None, false);
     app.restart()
 }
 
@@ -1275,21 +1487,29 @@ async fn offer_update(
     };
     append_log(state, &format!("Update {version} accepted by user"));
     quit.set_enabled(false).unwrap();
-    if let Err(error) = install_update(app, state, update, &update_dialog).await {
-        append_log(state, &format!("Update installation failed: {error}"));
-        let service_recovered = state.snapshot.lock().unwrap().child_pid.is_some();
-        let service_message = if service_recovered {
-            "任务面板服务已恢复。"
-        } else {
-            "任务面板服务未能恢复，请重新打开 App。"
-        };
-        update_dialog.close();
-        show_error_dialog(
-            app,
-            "Codex Taskboard 更新失败",
-            &format!("更新未完成。{service_message}\n\n请稍后重试。详情见启动日志。\n\n{error}"),
-        );
-        finish_update_flow(state, check_update, quit);
+    match install_update(app, state, update, &update_dialog).await {
+        Ok(()) => {
+            update_dialog.close();
+            finish_update_flow(state, check_update, quit);
+        }
+        Err(error) => {
+            append_log(state, &format!("Update installation failed: {error}"));
+            let service_recovered = state.snapshot.lock().unwrap().child_pid.is_some();
+            let service_message = if service_recovered {
+                "任务面板服务已恢复。"
+            } else {
+                "任务面板服务未能恢复，请重新打开 App。"
+            };
+            update_dialog.close();
+            show_error_dialog(
+                app,
+                "Codex Taskboard 更新失败",
+                &format!(
+                    "更新未完成。{service_message}\n\n请稍后重试。详情见启动日志。\n\n{error}"
+                ),
+            );
+            finish_update_flow(state, check_update, quit);
+        }
     }
 }
 

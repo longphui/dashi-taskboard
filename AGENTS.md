@@ -11,3 +11,111 @@ For feature work in this repository, use this order:
 The primary objective is to make the requested function work. Focus on the feature implementation itself and avoid over-design; safety, guardrails, and testing must not dominate the work or turn the feature into a surrounding engineering project. This rule supersedes the earlier standing instruction that every feature must be developed test-first. Test-first language in older issues does not apply unless the user restates it for that issue after this rule.
 
 This ordering does not waive higher-priority safety or security requirements. Keep validation that is necessary at real external boundaries, such as user input or external APIs, but do not expand it into hypothetical protection beyond the requested path.
+
+# Taskboard Delivery Workflow
+
+Use this workflow when the user asks to process Taskboard work.
+
+## 1. Read and claim work
+
+- Read only the Taskboard states that the user asked to process. For the normal development flow, claim `todo` items and continue unfinished `in_progress` items.
+- Never assign `backlog` items. Leave an item unclaimed when its description or latest comment explicitly requires waiting.
+- Read the full issue description, attachments, and all comments before routing or changing it.
+- GitHub Issue and PR synchronization is not a default step. Read or synchronize GitHub Issue/PR data only when the user explicitly requests it.
+- Use the packaged or injected `taskctl` and the exact active Taskboard runtime. Do not fall back to a global CLI, a guessed port, or another data source.
+
+## 2. Route for efficiency
+
+- Do not force one issue into one conversation or one worktree.
+- Group closely related issues in one conversation and worktree when they share the same feature chain and this reduces duplicate work or merge conflicts.
+- Run independent work in parallel when the paths do not conflict. Queue conflict-prone work and keep it visible.
+- Research, triage, replies, and other work that does not change code normally do not need a worktree.
+- For code changes, start from verified current `origin/main`, create a feature branch, and use a worktree. Never implement directly on `main`.
+- Keep task conversations visible and traceable. Do not pin newly created task conversations. Do not pass this no-pin rule, or restrictions on subagents, into the delegated task prompt unless the user requests it for that task.
+- Bind each claimed issue to the actual conversation, branch, and worktree used for it, and record the grouping decision in the issue.
+
+## 3. Follow E3
+
+1. **Estimate**: estimate the context, steps, overlap, and risk.
+2. **Execute**: prove and implement the smallest viable real path.
+3. **Expand**: read or change more only when direct verification fails.
+
+Before editing, record the real path in the issue:
+
+`entry point -> user or agent action -> component/API/data change -> observable result`
+
+Make the smallest root-cause change. Do not add unrelated refactors, abstractions, state machines, compatibility layers, speculative fallbacks, guardrails, or tests. Add targeted protection or tests only when the user explicitly requests them or reports a concrete failure that requires them.
+
+## 4. Preserve external contributions
+
+- When an issue already has an external contributor PR, review and improve that PR before creating a replacement.
+- Preserve the contributor's commits and authorship. Use a normal merge; do not squash, rebase, force-push, or rewrite the contributor's commits.
+- If a PR contains a usable subset, merge that subset and put remaining work in a later PR.
+- Close and replace an external PR only when it is abandoned, has the wrong direction, or cannot be maintained. Explain the reason first.
+- When there is only an issue and no corresponding PR, create a new branch, worktree, and PR.
+- Before final cleanup, verify that merged external authors are retained in repository history and Contributors.
+
+## 5. Implement, verify, and report
+
+- Keep the issue `in_progress` during implementation.
+- Verify the direct user path. For changes on a UI surface, use the real browser/App surface. Capture visual evidence when the result has visual impact; this evidence supports review and does not by itself require a separate user UI confirmation.
+- Report changed files, commit, exact head SHA, direct verification, PR, CI state, and remaining limitations in the issue.
+- Show ongoing status in the Taskboard opened through the injected Codex App.
+- Execution conversations do not merge, release, mark `done`, or claim user acceptance.
+
+## 6. Review by risk
+
+- The coordinating conversation reviews the diff, real path, evidence, scope, and CI before accepting an execution result.
+- Use ChatGPT web Pro review for complex or risky implementation. Ask it to review only implementation correctness and real bugs, without over-defensive or over-designed recommendations.
+- Wait for the complete Pro answer. Do not use an instant-answer result. Check at approximately five-minute intervals when necessary; a complete review can take more than 30 minutes.
+- Simple mechanical changes, documentation, README updates, version-only changes, and already-approved code followed only by trivial edits can skip Pro review.
+- Fix actionable blockers in the same PR. Repeat Pro review only when the new implementation complexity warrants it.
+- Decide the UI confirmation gate from the actual visual impact and risk. Do not trigger it mechanically because code is in a UI component or changes a UI file.
+- Logic-only changes on a UI surface do not need separate user UI confirmation when they do not cause a meaningful visual change. This includes interaction logic, data behavior, toggle behavior, popover close conditions, and copy-and-paste behavior.
+- Small, low-risk, and visually unambiguous changes can skip user UI confirmation after the coordinator checks the real path and visual evidence. Examples include a local font-size, spacing, alignment, or color adjustment.
+- Require user UI confirmation before merge when the change adds UI, meaningfully changes layout, information hierarchy, or the presentation of a core interaction, has multiple reasonable visual choices, or the user explicitly asks to confirm the style.
+- User UI confirmation is a final acceptance gate, not an intermediate development checkpoint. For work that requires it, ask only after the full function is complete, direct verification passes, and any complexity-based Pro review passes. Never ask the user to confirm a partially implemented UI.
+- After Pro approval, visual-only adjustments made from the user's final UI feedback do not require another Pro review. The coordinator checks that the delta is limited to the requested visual change, reruns the real path, and can then proceed to merge. If the adjustment changes functional logic or introduces new complex risk, reassess whether code review or Pro review is required.
+- Close temporary review browser tabs after review finishes.
+
+## 7. Acceptance and issue status
+
+- Reviewer approval means ready for user inspection, not user acceptance.
+- When work meets the UI confirmation gate, put the complete reviewed function into the Taskboard-launched Codex App and ask the user to confirm the final visual style only after implementation and any required Pro review are complete.
+- Do not merge work that meets the UI confirmation gate until the user confirms its style. After visual-only feedback is applied and directly verified, the change can proceed without repeating Pro review.
+- UI-surface work that does not meet the confirmation gate can proceed after the coordinator verifies the real path, visual impact, scope, and required review without a separate user UI pause.
+- After implementation and required review pass, move the issue to `in_review`.
+- Never move an issue to `done` unless the user explicitly accepts it or asks for completion.
+- If the user explicitly authorizes finishing and releasing the whole batch without another pause, that instruction authorizes the remaining review, merge, and release steps, but still does not authorize marking issues `done`.
+
+## 8. Merge and clean up
+
+- Merge only reviewed and authorized PRs into `main`. Do not merge unrelated open PRs.
+- Confirm the accepted commit is present on remote `main`.
+- After merge, remove the merged worktree, local feature branch, remote feature branch, and disposable files from that task.
+- Preserve all task conversations for traceability. Do not archive or delete them.
+- Do not touch unrelated dirty worktrees, branches, files, or active sessions.
+
+## 9. Release
+
+- Release only when the user requests it or explicitly includes release in the task.
+- Merge all included product PRs first. Use a minimal version PR for the required version fields; do not alter release infrastructure without a separate requirement.
+- Use a short tag such as `v1.0.7`. Release notes contain product changes only.
+- Keep the DMG as the first release asset.
+- Record live build, signing, notarization, upload, and publication progress in the Taskboard.
+- Verify the tag target, release target, workflow result, asset order, and updater metadata.
+- Do not overwrite the App in `/Applications`; leave the installed version available for update-check verification.
+
+## 10. Batch completion
+
+A requested batch is complete only when:
+
+- all eligible `todo` items are handled;
+- no item is unexpectedly left in `in_progress`;
+- explicit waiting items are reported;
+- included PRs are reviewed and merged into `main`;
+- changed issues are in `in_review`, not `done`;
+- the injected Codex App shows the latest status;
+- merged worktrees and feature branches are cleaned up;
+- task conversations remain available; and
+- any requested release is published and verified.

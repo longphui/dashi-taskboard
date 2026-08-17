@@ -848,7 +848,15 @@ function parseAttachmentHeaders(request) {
   if (contentType.length === 0 || contentType.length > 200 || !/^[!#$%&'*+.^_`|~0-9a-z-]+\/[!#$%&'*+.^_`|~0-9a-z-]+$/.test(contentType)) {
     throw new ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Attachment Content-Type is invalid");
   }
-  return { filename, contentType };
+  const kind = request.headers["x-taskboard-attachment-kind"];
+  if (kind !== "inline" && kind !== "attachment") {
+    throw new ApiError(
+      400,
+      "INVALID_ATTACHMENT_KIND",
+      "X-Taskboard-Attachment-Kind must be inline or attachment",
+    );
+  }
+  return { filename, contentType, kind };
 }
 
 async function readBody(request, limit, tooLargeMessage) {

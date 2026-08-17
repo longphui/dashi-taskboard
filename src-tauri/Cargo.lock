@@ -343,13 +343,17 @@ dependencies = [
 
 [[package]]
 name = "codex-taskboard-launcher"
-version = "1.0.5"
+version = "1.0.7"
 dependencies = [
+ "base64 0.22.1",
  "dispatch2",
+ "futures-util",
  "libc",
+ "minisign-verify",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "reqwest",
  "serde",
  "serde_json",
  "tauri",

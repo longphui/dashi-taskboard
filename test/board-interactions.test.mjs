@@ -156,8 +156,8 @@ test("issues expose processing conversations without manual binding", () => {
   assert.match(detailSource, /onOpenLegacyLocalThread\(comment\.legacyLocalThreadId!\)/);
   assert.doesNotMatch(detailSource, /compact/);
   assert.doesNotMatch(styles, /issue-conversation-link\.compact/);
-  assert.match(detailSource, /代码分支/);
-  assert.match(detailSource, /Worktree/);
+  assert.match(detailSource, /\.\.\.developmentOptions\.map\(\(context\) => \(\{/);
+  assert.match(detailSource, /context\.type === "branch" \? "branch" : "folder"/);
   assert.match(detailSource, /developmentContext/);
   assert.doesNotMatch(detailSource, /placeholder="绑定分支/);
   assert.doesNotMatch(contextMenuSource, /打开关联 Codex 对话/);
@@ -186,8 +186,9 @@ test("comments stage, upload, render and delete their own attachments", () => {
   assert.match(apiSource, /export async function uploadCommentAttachment/);
   assert.match(apiSource, /\/api\/comments\/\$\{encodeURIComponent\(commentId\)\}\/attachments/);
   assert.match(detailSource, /pendingCommentFiles/);
-  assert.match(detailSource, /uploadCommentAttachment\(comment\.id, file\)/);
-  assert.match(detailSource, /comment\.attachments[\s\S]*?\.filter\([\s\S]*?\.map\(\(attachment\) =>/);
+  assert.match(detailSource, /uploadCommentAttachment\(comment\.id, file, "attachment"\)/);
+  assert.match(detailSource, /comment\.attachments\.some\(\(attachment\) => attachment\.kind === "attachment"\)/);
+  assert.match(detailSource, /comment\.attachments[\s\S]*?\.filter\(\(attachment\) => attachment\.kind === "attachment"\)[\s\S]*?\.map\(\(attachment\) =>/);
   assert.match(detailSource, /setPendingAttachmentDelete\(attachment\)/);
 });
 

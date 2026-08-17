@@ -137,7 +137,7 @@ test("the automation menu reuses the board switches and keeps form focus chrome 
   assert.match(menuSource, /className=\{`board-setting-switch\$\{draft\.quotaAware \? " is-on" : ""\}`\}/);
   assert.match(menuSource, /aria-checked=\{draft\.quotaAware\}/);
   assert.doesNotMatch(menuSource, /type="checkbox"/);
-  assert.match(styles, /\.project-automation-field select:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s);
+  assert.match(styles, /\.project-automation-picker-trigger:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*0 0 0 2px var\(--accent-soft\);/s);
   assert.doesNotMatch(styles, /\.project-automation-switch input:focus-visible/);
 });
 
@@ -160,9 +160,9 @@ test("automation changes submit immediately with model-specific effort normaliza
   assert.match(menuSource, /onChange: \(options: AutomationOptions\) => void/);
   assert.match(menuSource, /const disabled = pending \|\| Boolean\(unavailableReason\)/);
   assert.match(menuSource, /const submitChange = \(next: AutomationOptions\) => \{[\s\S]*?setDraft\(next\);[\s\S]*?onChange\(next\);[\s\S]*?\}/);
-  assert.match(menuSource, /submitChange\(withAutomationModel\(draft, event\.target\.value as AutomationModel\)\)/);
+  assert.match(menuSource, /submitChange\(withAutomationModel\(draft, value as AutomationModel\)\)/);
   assert.match(menuSource, /getAutomationModel\(draft\.model\)\.efforts\.map/);
-  assert.match(menuSource, /<option key=\{effort\} value=\{effort\}>\{text\(\.\.\.EFFORT_LABELS\[effort\]\)\}<\/option>/);
+  assert.match(menuSource, /getAutomationModel\(draft\.model\)\.efforts\.map[\s\S]*?label: text\(\.\.\.EFFORT_LABELS\[effort\]\)/);
   assert.match(menuSource, /low: \["轻度", "Low"\]/);
   assert.match(menuSource, /xhigh: \["极高 \(xhigh\)", "Extra high \(xhigh\)"\]/);
   assert.match(menuSource, /max: \["最高", "Maximum"\]/);

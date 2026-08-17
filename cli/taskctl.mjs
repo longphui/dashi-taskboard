@@ -97,7 +97,7 @@ const COMMAND_OPTIONS = new Map([
   ["comment update", new Set(["body", "thread-id", "if-version", "json"])],
   ["comment delete", new Set(["thread-id", "if-version", "json"])],
   ["attachment download", new Set(["output", "json"])],
-  ["attachment upload", new Set(["file", "task", "comment", "content-type", "json"])],
+  ["attachment upload", new Set(["file", "task", "comment", "content-type", "kind", "json"])],
   ["context current", new Set(["cwd", "json"])],
 ]);
 
@@ -408,7 +408,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
         size: Number(response.headers.get("content-length")) || bytes.byteLength,
       };
     },
-    async upload(pathname, { body, contentType, filename }) {
+    async upload(pathname, { body, contentType, filename, kind }) {
       let response;
       try {
         response = await fetchImplementation(resolveApiUrl(baseUrl, pathname), {
@@ -418,6 +418,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
             "content-type": contentType,
             "x-taskboard-client": "taskctl",
             "x-taskboard-filename": encodeURIComponent(filename),
+            "x-taskboard-attachment-kind": kind,
           },
           body,
         });
@@ -501,6 +502,10 @@ async function uploadAttachment(api, options, overrides) {
   if (!contentType) {
     throw usageError("--content-type cannot be empty");
   }
+  const kind = options.kind ?? (contentType.startsWith("image/") ? "inline" : "attachment");
+  if (kind !== "inline" && kind !== "attachment") {
+    throw usageError("--kind must be inline or attachment");
+  }
 
   const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const pathname = taskId
@@ -510,11 +515,13 @@ async function uploadAttachment(api, options, overrides) {
     body,
     contentType,
     filename,
+    kind,
   });
 
   return {
     attachment: payload.attachment ?? null,
     file: filePath,
+    kind,
     target: taskId
       ? { type: "task", id: taskId }
       : { type: "comment", id: commentId },

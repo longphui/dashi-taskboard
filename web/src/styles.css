@@ -1135,6 +1135,17 @@ kbd {
   background: transparent;
 }
 
+.task-filter-trigger.board-card-display-trigger {
+  justify-content: center;
+  color: var(--text-primary);
+}
+
+.board-card-display-trigger > svg {
+  width: 14px;
+  height: 14px;
+  color: inherit;
+}
+
 .task-filter-trigger.is-active {
   background: var(--accent-soft);
 }
@@ -1274,9 +1285,17 @@ kbd {
   flex: 0 0 auto;
 }
 
-.project-automation-field select {
-  min-width: 98px;
+.project-automation-picker {
+  flex: 0 0 132px;
+  width: 132px;
+}
+
+.project-automation-picker-trigger {
+  display: flex;
+  align-items: center;
+  width: 100%;
   height: 26px;
+  gap: 6px;
   padding: 0 6px;
   border: var(--border-hairline) solid var(--border);
   border-radius: 5px;
@@ -1284,11 +1303,20 @@ kbd {
   background: var(--surface);
   color: var(--text-primary);
   font: inherit;
+  text-align: left;
 }
 
-.project-automation-field select:focus-visible {
+.project-automation-picker-trigger:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.project-automation-picker-trigger:focus-visible {
   outline: 0;
-  box-shadow: none;
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.project-automation-picker-trigger .task-property-trigger-label {
+  flex: 1 1 auto;
 }
 
 .project-automation-note,
@@ -2129,8 +2157,7 @@ kbd {
   pointer-events: auto;
 }
 
-.due-date-chip input,
-.task-participants-control select {
+.due-date-chip input {
   position: absolute;
   inset: 0;
   z-index: 1;
@@ -2144,7 +2171,7 @@ kbd {
 }
 
 .due-date-chip:has(input:focus-visible),
-.task-participants-control:has(select:focus-visible),
+.task-assignee-trigger:focus-visible,
 .card-label-trigger:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -2177,6 +2204,19 @@ kbd {
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
+}
+
+.task-assignee-trigger {
+  display: inline-flex;
+  align-items: center;
+  min-width: 16px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
 }
 
 .card-topline {
@@ -2230,6 +2270,19 @@ kbd {
   font-size: 13px;
   font-weight: 500;
   line-height: 18px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.task-card-description {
+  display: -webkit-box;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
@@ -2574,7 +2627,7 @@ kbd {
   border-radius: 7px;
 }
 
-.issue-description-composer .inline-media-composer textarea {
+.issue-description-composer .inline-media-composer {
   min-height: 24px;
   padding: 0;
   font-size: inherit;
@@ -2582,7 +2635,7 @@ kbd {
   line-height: inherit;
 }
 
-.issue-description-composer .inline-media-composer > textarea:only-child {
+.issue-description-composer .inline-media-composer[data-empty="true"] {
   min-height: 42px;
 }
 
@@ -2658,6 +2711,63 @@ kbd {
 
 .issue-description-document a:hover {
   text-decoration: underline;
+}
+
+.issue-description-document a.issue-reference-link {
+  display: inline-flex;
+  color: inherit;
+  vertical-align: middle;
+}
+
+.issue-description-document a.issue-reference-link:hover {
+  text-decoration: none;
+}
+
+.issue-reference-inline {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  gap: 5px;
+  padding: 0 6px 0 4px;
+  border-radius: 5px;
+  background: var(--column-status-background, var(--surface-hover));
+  box-shadow: inset 0 0 0 var(--border-hairline) var(--border);
+  color: var(--text-secondary);
+  font-size: 0.94em;
+  line-height: 22px;
+  white-space: nowrap;
+}
+
+.issue-reference-link:hover .issue-reference-inline {
+  background: var(--column-status-background, var(--surface-active));
+}
+
+.issue-reference-status {
+  display: grid;
+  place-items: center;
+  flex: 0 0 15px;
+  width: 15px;
+  height: 15px;
+}
+
+.issue-reference-status .taskboard-icon {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border-radius: 0;
+}
+
+.issue-reference-id {
+  flex: 0 0 auto;
+  color: var(--column-status-color, var(--text-secondary));
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+}
+
+.issue-reference-title {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .issue-description-document ul,
@@ -2912,8 +3022,8 @@ kbd {
   color: var(--text-tertiary);
 }
 
-.issue-attachments {
-  padding: 0 14px 30px;
+.issue-editor .issue-attachments {
+  padding: 0;
 }
 
 .issue-sub-issues {
@@ -3218,6 +3328,10 @@ kbd {
   min-height: 28px;
   gap: 12px;
   margin-bottom: 7px;
+}
+
+.issue-attachment-controls .attachment-add-button {
+  margin-left: auto;
 }
 
 .attachments-heading > div {
@@ -3913,16 +4027,26 @@ kbd {
   padding: 0 0 16px;
 }
 
-.inline-media-composer textarea {
-  display: block;
+.inline-media-composer {
+  position: relative;
   width: 100%;
-  resize: none;
   border: 0;
   outline: 0;
   background: transparent;
   color: var(--text-primary);
   font-size: 12px;
   line-height: 19px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.inline-media-composer[data-empty="true"]::before {
+  position: absolute;
+  content: attr(data-placeholder);
+  color: var(--text-tertiary);
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .comment-edit-actions {
@@ -4002,19 +4126,13 @@ kbd {
   padding: 10px 16px 14px;
 }
 
-.comment-inline-media textarea {
-  min-height: 24px;
-  padding: 0;
+.comment-inline-media {
   font-size: 15px;
   line-height: 24px;
 }
 
-.comment-inline-media > textarea:only-child {
+.comment-inline-media[data-empty="true"] {
   min-height: 82px;
-}
-
-.comment-inline-media textarea::placeholder {
-  color: var(--text-tertiary);
 }
 
 .comment-composer-files {
@@ -6241,15 +6359,10 @@ kbd {
   min-height: 118px;
   margin-top: 2px;
   padding: 6px 0 12px;
+  font-size: 15px;
 }
 
-.inline-media-description textarea {
-  min-height: 24px;
-  margin: 0;
-  padding: 0;
-}
-
-.inline-media-description > textarea:only-child {
+.inline-media-description[data-empty="true"] {
   min-height: 100px;
 }
 
@@ -6292,6 +6405,39 @@ kbd {
 .property-relation-chip {
   flex: 0 0 auto;
   white-space: nowrap;
+}
+
+.property-relation-kind {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.property-relation-tooltip {
+  position: absolute;
+  z-index: 40;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  display: none;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 24px));
+  padding: 5px 8px;
+  border: var(--border-hairline) solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 16px;
+  pointer-events: none;
+  transform: translateX(-50%);
+  white-space: normal;
+}
+
+.property-relation-chip:hover .property-relation-tooltip,
+.property-relation-chip:focus-within .property-relation-tooltip {
+  display: block;
 }
 
 .property-relation-remove {
@@ -6495,6 +6641,39 @@ kbd {
 
 .inline-media-composer {
   width: 100%;
+}
+
+.inline-media-text {
+  white-space: pre-wrap;
+}
+
+.inline-media-atom {
+  display: inline;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.inline-media-image-atom {
+  display: block;
+}
+
+.inline-media-atom.is-range-selected > .inline-media-issue-reference {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 58%, transparent);
+}
+
+.inline-media-image-atom.is-range-selected > .inline-media-image {
+  border-radius: 8px;
+  outline: 1px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.inline-media-issue-reference {
+  appearance: none;
+  border: 0;
+  font-family: inherit;
+  cursor: text;
 }
 
 .inline-media-image {
@@ -9364,20 +9543,47 @@ kbd {
   background: transparent;
 }
 
-.board-column.status-todo .column-header {
-  background: rgba(151, 71, 255, .1);
+.board-column.status-todo,
+.issue-reference-inline.issue-reference-status-backlog,
+.issue-reference-inline.issue-reference-status-todo {
+  --column-status-color: #9747ff;
+  --column-status-background: rgba(151, 71, 255, .1);
 }
 
-.board-column.status-in_progress .column-header {
-  background: rgba(0, 165, 88, .15);
+.board-column.status-in_progress,
+.issue-reference-inline.issue-reference-status-in_progress {
+  --column-status-color: #00a558;
+  --column-status-background: rgba(0, 165, 88, .15);
 }
 
-.board-column.status-in_review .column-header {
-  background: rgba(49, 124, 255, .1);
+.board-column.status-in_review,
+.issue-reference-inline.issue-reference-status-in_review {
+  --column-status-color: #317cff;
+  --column-status-background: rgba(49, 124, 255, .1);
 }
 
+.board-column.status-blocked,
+.issue-reference-inline.issue-reference-status-blocked {
+  --column-status-color: #e5484d;
+  --column-status-background: rgba(229, 72, 77, .1);
+}
+
+.issue-reference-inline.issue-reference-status-done {
+  --column-status-color: var(--status-done);
+  --column-status-background: color-mix(in srgb, var(--status-done) 10%, transparent);
+}
+
+.issue-reference-inline.issue-reference-status-canceled {
+  --column-status-color: var(--status-canceled);
+  --column-status-background: color-mix(in srgb, var(--status-canceled) 10%, transparent);
+}
+
+.board-column.status-todo .column-header,
+.board-column.status-in_progress .column-header,
+.board-column.status-in_review .column-header,
 .board-column.status-blocked .column-header {
-  background: rgba(229, 72, 77, .1);
+  background: var(--column-status-background);
+  color: var(--column-status-color);
 }
 
 .board-column:not(:first-child) .column-header::before {
@@ -9421,11 +9627,6 @@ kbd {
   max-width: 14px;
   max-height: 14px;
 }
-
-.board-column.status-todo .column-header { color: #9747ff; }
-.board-column.status-in_progress .column-header { color: #00a558; }
-.board-column.status-in_review .column-header { color: #317cff; }
-.board-column.status-blocked .column-header { color: #e5484d; }
 
 .column-actions {
   color: inherit;

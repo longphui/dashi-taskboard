@@ -24,6 +24,7 @@ interface TaskPropertyPickerProps<Value extends string> {
   disabled?: boolean;
   className?: string;
   triggerClassName: string;
+  triggerContent?: ReactNode;
   ariaLabel: string;
   title?: string;
   onOpenChange: (open: boolean) => void;
@@ -37,6 +38,7 @@ export function TaskPropertyPicker<Value extends string>({
   disabled = false,
   className = "",
   triggerClassName,
+  triggerContent,
   ariaLabel,
   title,
   onOpenChange,
@@ -48,7 +50,7 @@ export function TaskPropertyPicker<Value extends string>({
   const [position, setPosition] = useState({ left: 0, top: 0 });
   const [focusedIndex, setFocusedIndex] = useState(0);
   const selected = options.find((option) => option.value === value) ?? options[0];
-  const portalTarget = triggerRef.current?.closest("dialog") ?? document.body;
+  const portalTarget = triggerRef.current?.closest("dialog, [role='dialog']") ?? document.body;
 
   function optionElements(): HTMLButtonElement[] {
     return Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='option']") ?? []);
@@ -201,8 +203,12 @@ export function TaskPropertyPicker<Value extends string>({
           onOpenChange(true);
         }}
       >
-        <span className="task-property-trigger-icon">{selected.icon}</span>
-        <span className="task-property-trigger-label">{selected.label}</span>
+        {triggerContent ?? (
+          <>
+            <span className="task-property-trigger-icon">{selected.icon}</span>
+            <span className="task-property-trigger-label">{selected.label}</span>
+          </>
+        )}
       </button>
       {menu}
     </div>

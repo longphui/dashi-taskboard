@@ -325,6 +325,7 @@ function attachmentFromRow(row) {
     id: row.id,
     taskId: row.task_id,
     commentId: row.comment_id,
+    kind: row.kind,
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -556,6 +557,7 @@ export class TaskboardDatabase {
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('inline', 'attachment')),
         filename TEXT NOT NULL,
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
@@ -865,6 +867,32 @@ export class TaskboardDatabase {
     const attachmentColumns = this.database.prepare("PRAGMA table_info(attachments)").all();
     if (!attachmentColumns.some((column) => column.name === "comment_id")) {
       this.database.exec("ALTER TABLE attachments ADD COLUMN comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE");
+    }
+    if (!attachmentColumns.some((column) => column.name === "kind")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN kind TEXT NOT NULL DEFAULT 'attachment' CHECK (kind IN ('inline', 'attachment'))");
+      this.database.exec(`
+        UPDATE attachments
+        SET kind = 'inline'
+        WHERE content_type LIKE 'image/%'
+          AND (
+            (
+              comment_id IS NULL
+              AND EXISTS (
+                SELECT 1 FROM tasks
+                WHERE tasks.id = attachments.task_id
+                  AND instr(tasks.description, 'api/attachments/' || attachments.id || '/content') > 0
+              )
+            )
+            OR (
+              comment_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM comments
+                WHERE comments.id = attachments.comment_id
+                  AND instr(comments.body, 'api/attachments/' || attachments.id || '/content') > 0
+              )
+            )
+          )
+      `);
     }
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
 
@@ -2557,9 +2585,9 @@ export class TaskboardDatabase {
   createAttachment(taskId, input) {
     const task = this.#requireTask(taskId);
     this.database.prepare(`
-      INSERT INTO attachments (id, task_id, comment_id, filename, content_type, size, created_at)
-      VALUES (?, ?, NULL, ?, ?, ?, ?)
-    `).run(input.id, task.id, input.filename, input.contentType, input.size, now());
+      INSERT INTO attachments (id, task_id, comment_id, kind, filename, content_type, size, created_at)
+      VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
+    `).run(input.id, task.id, input.kind, input.filename, input.contentType, input.size, now());
     return this.getAttachment(input.id);
   }
 
@@ -2574,9 +2602,9 @@ export class TaskboardDatabase {
   createCommentAttachment(commentId, input) {
     const comment = this.#requireComment(commentId);
     this.database.prepare(`
-      INSERT INTO attachments (id, task_id, comment_id, filename, content_type, size, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(input.id, comment.taskId, comment.id, input.filename, input.contentType, input.size, now());
+      INSERT INTO attachments (id, task_id, comment_id, kind, filename, content_type, size, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(input.id, comment.taskId, comment.id, input.kind, input.filename, input.contentType, input.size, now());
     return this.getAttachment(input.id);
   }
 

@@ -33,11 +33,11 @@ test("issue detail renders descriptions and comments with GFM markdown", () => {
   );
   assert.match(
     detailSource,
-    /\{description\s*\?\s*<DescriptionDocument value=\{description\} tasks=\{tasks\} onOpenTask=\{onOpenTask\} \/>\s*:\s*text\("添加描述…", "Add description…"\)\}/,
+    /\{description\s*\?\s*<DescriptionDocument\s*value=\{description\}\s*referenceTasks=\{referenceTasks\}\s*onOpenTask=\{onOpenTask\}\s*\/>\s*:\s*text\("添加描述…", "Add description…"\)\}/,
   );
   assert.match(
     detailSource,
-    /comment\.body && \(\s*<div className="comment-body">\s*<DescriptionDocument value=\{comment\.body\} tasks=\{tasks\} onOpenTask=\{onOpenTask\} \/>\s*<\/div>\s*\)/s,
+    /comment\.body && \(\s*<div className="comment-body">\s*<DescriptionDocument\s*value=\{comment\.body\}\s*referenceTasks=\{referenceTasks\}\s*onOpenTask=\{onOpenTask\}\s*\/>\s*<\/div>\s*\)/s,
   );
   assert.doesNotMatch(detailSource, /value\.split\("\\n"\)/);
 });

@@ -65,7 +65,8 @@ test("new issues stage attachments in the composer and upload them after creatio
   assert.match(editorSource, /<PendingAttachments[\s\S]*?uploadLabel=\{text\("保存后上传", "Upload after saving"\)\}/);
   assert.match(pendingAttachmentsSource, /className="composer-attachment-list"/);
   assert.match(appSource, /Promise\.allSettled/);
-  assert.match(appSource, /uploadAttachment\(saved\.id, file\)/);
+  assert.match(appSource, /uploadAttachment\(saved\.id, file, "attachment"\)/);
+  assert.match(appSource, /uploadAttachment\(saved\.id, image\.file, "inline"\)/);
   assert.match(appSource, /zh: `\$\{failedAttachments\} 个附件`[\s\S]*?以下内容写入失败/);
 });
 

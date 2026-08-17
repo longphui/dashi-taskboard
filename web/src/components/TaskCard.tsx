@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
 import { attachmentContentUrl, resolvePersistedAttachmentUrl } from "../api";
 import {
   TASK_PRIORITIES,
@@ -36,6 +39,8 @@ interface TaskCardProps {
   isContextMenuOpen: boolean;
   availableLabels: string[];
   currentUser: ActorIdentity;
+  showCover: boolean;
+  showBody: boolean;
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
@@ -44,6 +49,37 @@ interface TaskCardProps {
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
+}
+
+interface TaskCardMarkdownNode {
+  type: string;
+  value?: string;
+  children?: TaskCardMarkdownNode[];
+}
+
+const taskCardMarkdownParser = unified().use(remarkParse).use(remarkGfm);
+
+function taskBodyText(value: string) {
+  function visibleText(node: TaskCardMarkdownNode): string {
+    if (node.type === "image" || node.type === "imageReference" || node.type === "definition") {
+      return "";
+    }
+    if (node.type === "break") return " ";
+    if (node.value !== undefined) return node.value;
+    const separator = node.type === "root"
+      || node.type === "blockquote"
+      || node.type === "list"
+      || node.type === "listItem"
+      || node.type === "table"
+      || node.type === "tableRow"
+      ? " "
+      : "";
+    return node.children?.map(visibleText).join(separator) ?? "";
+  }
+
+  return visibleText(taskCardMarkdownParser.parse(value) as TaskCardMarkdownNode)
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function calendarDate(value: string, locale: string) {
@@ -324,12 +360,16 @@ function AssigneeControl({
   participants,
   currentUser,
   disabled,
+  open,
+  onOpenChange,
   onChange,
 }: {
   task: Task;
   participants: ActorIdentity[];
   currentUser: ActorIdentity;
   disabled: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onChange: (target: AssigneeTarget) => void;
 }) {
   const { text } = useTaskboardI18n();
@@ -339,25 +379,27 @@ function AssigneeControl({
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
   return (
-    <label className="task-participants-control card-property-control" title={text(`负责人：${task.assignee.name}`, `Assignee: ${task.assignee.name}`)}>
-      <ParticipantAvatars participants={participants} />
-      <select
-        aria-label={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
-        value={actorKey(task.assignee)}
-        disabled={disabled}
-        onChange={(event) => {
-          const selected = options.find((actor) => actorKey(actor) === event.target.value);
-          const target = selected ? assigneeTargetForActor(selected, currentUser) : undefined;
-          if (target) onChange(target);
-        }}
-      >
-        {options.map((actor) => (
-          <option value={actorKey(actor)} key={actorKey(actor)}>
-            {actor.id === currentUser.id ? text(`${actor.name}（我）`, `${actor.name} (me)`) : actor.name}
-          </option>
-        ))}
-      </select>
-    </label>
+    <TaskPropertyPicker
+      value={actorKey(task.assignee)}
+      options={options.map((actor) => ({
+        value: actorKey(actor),
+        label: actor.id === currentUser.id ? text(`${actor.name}（我）`, `${actor.name} (me)`) : actor.name,
+        icon: <ActorAvatar actor={actor} className="task-property-assignee-avatar" />,
+      }))}
+      open={open}
+      disabled={disabled}
+      className="task-participants-control card-property-control"
+      triggerClassName="task-assignee-trigger"
+      triggerContent={<ParticipantAvatars participants={participants} />}
+      ariaLabel={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
+      title={text(`负责人：${task.assignee.name}`, `Assignee: ${task.assignee.name}`)}
+      onOpenChange={onOpenChange}
+      onChange={(value) => {
+        const selected = options.find((actor) => actorKey(actor) === value);
+        const target = selected ? assigneeTargetForActor(selected, currentUser) : undefined;
+        if (target) onChange(target);
+      }}
+    />
   );
 }
 
@@ -373,6 +415,8 @@ export function TaskCard({
   isContextMenuOpen,
   availableLabels,
   currentUser,
+  showCover,
+  showBody,
   onCreateLabel,
   onEdit,
   onUpdate,
@@ -384,7 +428,7 @@ export function TaskCard({
 }: TaskCardProps) {
   const { locale, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
-  const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | null>(null);
+  const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | "assignee" | null>(null);
   const [savingProperty, setSavingProperty] = useState<"priority" | "labels" | "dueDate" | "assignee" | null>(null);
   const creator: ActorIdentity = {
     type: task.creatorType,
@@ -401,7 +445,11 @@ export function TaskCard({
   const showsConversation = supportsConversation && presentation.conversations.length > 0;
   const showsInlineParticipants = variant === "main"
     && task.participants.length > 0;
-  const image = firstTaskImage(task);
+  const image = showCover ? firstTaskImage(task) : null;
+  const body = useMemo(
+    () => showBody ? taskBodyText(task.description) : "",
+    [showBody, task.description],
+  );
   const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
   const showsProperties = !processingCard
     && (hasProperties || showsInlineParticipants || showsConversation);
@@ -469,6 +517,8 @@ export function TaskCard({
               participants={task.participants.length ? task.participants : [creator]}
               currentUser={currentUser}
               disabled={propertyDisabled || task.source === "jira"}
+              open={propertyMenu === "assignee"}
+              onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
             <span>{createdDate(task.createdAt, locale, text)}</span>
@@ -481,6 +531,8 @@ export function TaskCard({
       {(task.status === "todo" || task.status === "in_progress") && task.resumeRequest && (
         <TaskResumeStatus task={task} />
       )}
+
+      {body && <p className="task-card-description">{body}</p>}
 
       {image && (
         <TaskCardMedia key={image} src={image} />
@@ -525,6 +577,8 @@ export function TaskCard({
               participants={task.participants}
               currentUser={currentUser}
               disabled={propertyDisabled || task.source === "jira"}
+              open={propertyMenu === "assignee"}
+              onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
           )}

@@ -58,7 +58,7 @@ export function StatusIcon({ status }: { status: TaskStatus }) {
   return <TaskboardIcon name={STATUS_ICONS[status]} />;
 }
 
-function ColumnStatusIcon({ status }: { status: TaskStatus }) {
+export function ColumnStatusIcon({ status }: { status: TaskStatus }) {
   return <TaskboardIcon name={COLUMN_STATUS_ICONS[status]} />;
 }
 
@@ -77,6 +77,8 @@ interface BoardColumnProps {
   contextMenuTaskId: string | null;
   availableLabels: string[];
   currentUser: ActorIdentity;
+  showCover: boolean;
+  showBody: boolean;
   createEnabled?: boolean;
   onCreateLabel: (label: string) => Promise<void>;
   onCreate: (status: TaskStatus) => void;
@@ -106,6 +108,8 @@ export function BoardColumn({
   contextMenuTaskId,
   availableLabels,
   currentUser,
+  showCover,
+  showBody,
   createEnabled = true,
   onCreateLabel,
   onCreate,
@@ -224,6 +228,8 @@ export function BoardColumn({
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}
               currentUser={currentUser}
+              showCover={showCover}
+              showBody={showBody}
               onCreateLabel={onCreateLabel}
               onEdit={onEdit}
               onUpdate={onUpdate}
