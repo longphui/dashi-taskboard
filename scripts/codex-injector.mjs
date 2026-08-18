@@ -570,6 +570,7 @@ class CdpConnection {
   }
 
   close() {
+    this.closed = true;
     this.socket.close();
   }
 }
@@ -2256,17 +2257,32 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   }
 
   async function publishHeartbeat() {
-    const executionContextId = await install();
-    await cdp.send("Runtime.evaluate", {
-      contextId: executionContextId,
-      expression: `window.postMessage({
-        type: ${JSON.stringify(hostHeartbeatMessage)},
-        capability: ${JSON.stringify(hostCapability)},
-        at: Date.now(),
-        startupToken: ${JSON.stringify(startupToken)}
-      }, window.location.origin)`,
-      returnByValue: true,
-    });
+    let timeout;
+    try {
+      await Promise.race([
+        (async () => {
+          const executionContextId = await install();
+          await cdp.send("Runtime.evaluate", {
+            contextId: executionContextId,
+            expression: `window.postMessage({
+              type: ${JSON.stringify(hostHeartbeatMessage)},
+              capability: ${JSON.stringify(hostCapability)},
+              at: Date.now(),
+              startupToken: ${JSON.stringify(startupToken)}
+            }, window.location.origin)`,
+            returnByValue: true,
+          });
+        })(),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            cdp.close();
+            reject(new Error("Timed out publishing the Taskboard host heartbeat"));
+          }, 3_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   return { install, publishHeartbeat };

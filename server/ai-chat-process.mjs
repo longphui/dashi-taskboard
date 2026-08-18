@@ -347,6 +347,7 @@ export function spawnCodexTurn({
     detached: true,
     env: withoutTaskboardLauncherEnvironment(env),
     stdio: ["pipe", "pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
 
   let stdoutChunks = [];

@@ -20,9 +20,12 @@ import {
   createAiChatThread,
   deleteAiChatThread,
   getAiChatCatalog,
+  getAiChatComposerCandidates,
   getAiChatThread,
   interruptAiChatRun,
+  compactAiChatThread,
   listAiChatThreads,
+  startAiChatComposerTurn,
   startAiChatTurn,
   subscribeAiChatThread,
   updateAiChatThread,
@@ -31,15 +34,20 @@ import {
   AI_CHAT_SKILL_MARKER,
   aiChatEventStatus,
   buildThreadCreateInput,
+  buildComposerTurnInput,
   buildTurnInput,
   chatPrimaryAction,
   createAiSnapshotRefreshQueue,
+  createComposerDocument,
   filterVisibleAiEvents,
   needsDangerConfirmation,
   normalizeChatSelection,
   parseAiChatComposerFragment,
   patchAiChatSnapshot,
   reasoningEffortForModel,
+  insertComposerAgent,
+  insertComposerSkill,
+  serializeComposerDocument,
 } from "../aiChatState";
 import type {
   AiChatCatalog,
@@ -51,6 +59,14 @@ import type {
   AiChatSkill,
   AiChatThread,
   AiChatThreadSnapshot,
+  ComposerCandidatesResponse,
+  ComposerDocument,
+  ComposerPersistedDocument,
+  ComposerAgentCandidate,
+  ComposerCandidate,
+  ComposerSkillCandidate,
+  ComposerSlashActionCandidate,
+  ComposerTrigger,
 } from "../types";
 import { LinearIcon, type LinearIconName } from "./LinearIcon";
 import { TaskboardIcon } from "./TaskboardIcon";
@@ -62,6 +78,15 @@ export type AiChatOpenThreadRequest = {
   projectId: string;
   issueId: string | null;
   composerText: string;
+  requestId: number;
+} | {
+  projectId: string;
+  issueId: string | null;
+  composerDraft: {
+    ready: boolean;
+    revision: string;
+    document: ComposerDocument | ComposerPersistedDocument;
+  };
   requestId: number;
 };
 
@@ -77,6 +102,8 @@ type MenuName = "model" | "model-list" | "effort-list" | "sandbox" | null;
 type PendingDangerInput = {
   message: string;
   skillIds: string[];
+  composerDocument?: ComposerDocument;
+  composerRevision?: string;
   attachments: AiChatAttachmentInput[];
   clearSubmittedDraft: boolean;
 };
@@ -86,10 +113,14 @@ type ComposerAttachment = AiChatAttachmentInput & {
 };
 type ComposerSkillToken = {
   key: string;
-  id: string;
+  candidateRef: string;
+  label: string;
+  kind?: "skill" | "agent";
+  unavailable?: boolean;
   element: HTMLSpanElement;
 };
-type ComposerSkillQuery = {
+type ComposerQuery = {
+  trigger: ComposerTrigger;
   query: string;
 };
 type ComposerBeforeInput = {
@@ -256,7 +287,7 @@ function serializeComposer(root: HTMLElement): { message: string; skillIds: stri
       return;
     }
     if (!(node instanceof HTMLElement)) return;
-    const skillId = node.dataset.skillId;
+    const skillId = node.dataset.skillId ?? node.dataset.composerCandidateRef;
     if (skillId) {
       message += SKILL_MARKER;
       skillIds.push(skillId);
@@ -273,6 +304,58 @@ function serializeComposer(root: HTMLElement): { message: string; skillIds: stri
   };
   for (const child of root.childNodes) visit(child);
   return { message, skillIds };
+}
+
+function serializeComposerDocumentFromDom(root: HTMLElement): ComposerDocument {
+  let document = createComposerDocument();
+  const appendText = (value: string) => {
+    const text = value.replaceAll("\u200B", "");
+    if (!text) return;
+    const nodes = document.nodes;
+    const previous = nodes.at(-1);
+    document = previous?.type === "text"
+      ? { version: 1, nodes: [...nodes.slice(0, -1), { type: "text", text: previous.text + text }] }
+      : { version: 1, nodes: [...nodes, { type: "text", text }] };
+  };
+  const visit = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      appendText(node.textContent ?? "");
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    const candidateRef = node.dataset.composerCandidateRef;
+    if (candidateRef) {
+      document = {
+        version: 1,
+        nodes: [...document.nodes, {
+          type: node.dataset.composerKind === "agent" ? "agent" : "skill",
+          candidateRef,
+          label: node.dataset.composerLabel ?? "",
+        }],
+      };
+      return;
+    }
+    if (node.tagName === "BR") {
+      appendText("\n");
+      return;
+    }
+    const isBlock = node.tagName === "DIV" || node.tagName === "P";
+    const previousText = document.nodes.at(-1);
+    if (
+      isBlock
+      && document.nodes.length > 0
+      && !(previousText?.type === "text" && previousText.text.endsWith("\n"))
+    ) appendText("\n");
+    for (const child of node.childNodes) visit(child);
+    const finalText = document.nodes.at(-1);
+    if (
+      isBlock
+      && node.nextSibling
+      && !(finalText?.type === "text" && finalText.text.endsWith("\n"))
+    ) appendText("\n");
+  };
+  for (const child of root.childNodes) visit(child);
+  return serializeComposerDocument(document);
 }
 
 function selectedComposerFragment(root: HTMLElement): {
@@ -457,38 +540,62 @@ function composerFragmentFromPlainText(
   return { message, skillIds };
 }
 
-function composerSkillQueryAt(
+function composerQueryAt(
   root: HTMLElement,
   focusNode: Text,
   focusOffset: number,
-): { query: string; range: Range } | null {
+): { trigger: ComposerTrigger; query: string; range: Range } | null {
   if (!root.contains(focusNode)) return null;
   const rawPrefix = (focusNode.textContent ?? "").slice(0, focusOffset);
   const prefix = rawPrefix.replaceAll("\u200B", "");
-  const match = /(?:^|\s)@([^\s@]*)$/.exec(prefix);
+  const match = /(?:^|\s)([@/])([^\s@/]*)$/.exec(prefix);
   if (!match) return null;
-  const at = rawPrefix.lastIndexOf("@");
+  const trigger = match[1] as ComposerTrigger;
+  const triggerOffset = rawPrefix.lastIndexOf(trigger);
   const range = root.ownerDocument.createRange();
-  range.setStart(focusNode, at);
+  range.setStart(focusNode, triggerOffset);
   range.setEnd(focusNode, focusOffset);
-  return { query: match[1].toLocaleLowerCase(), range };
+  return { trigger, query: match[2], range };
 }
 
-function composerSkillQuery(root: HTMLElement): { query: string; range: Range } | null {
+function composerQuery(root: HTMLElement): {
+  trigger: ComposerTrigger;
+  query: string;
+  range: Range;
+} | null {
   const selection = root.ownerDocument.getSelection();
-  if (!selection || !selection.isCollapsed || selection.focusNode?.nodeType !== Node.TEXT_NODE) {
+  if (!selection || !selection.isCollapsed || !selection.focusNode) return null;
+  if (selection.focusNode.nodeType === Node.TEXT_NODE) {
+    return composerQueryAt(root, selection.focusNode as Text, selection.focusOffset);
+  }
+  if (!(selection.focusNode instanceof HTMLElement) || !root.contains(selection.focusNode)) {
     return null;
   }
-  return composerSkillQueryAt(root, selection.focusNode as Text, selection.focusOffset);
+  let candidate = selection.focusNode.childNodes[selection.focusOffset - 1] ?? null;
+  while (candidate?.lastChild) candidate = candidate.lastChild;
+  return candidate?.nodeType === Node.TEXT_NODE
+    ? composerQueryAt(root, candidate as Text, candidate.textContent?.length ?? 0)
+    : null;
 }
 
-function composerSkillQueryAfterInput(
+function composerQueryAtEnd(root: HTMLElement): {
+  trigger: ComposerTrigger;
+  query: string;
+  range: Range;
+} | null {
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let lastText: Text | null = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) lastText = node as Text;
+  return lastText ? composerQueryAt(root, lastText, lastText.length) : null;
+}
+
+function composerQueryAfterInput(
   root: HTMLElement,
   beforeInput: ComposerBeforeInput,
-): { query: string; range: Range } | null {
+): { trigger: ComposerTrigger; query: string; range: Range } | null {
   if (beforeInput.container.nodeType === Node.TEXT_NODE) {
     const textNode = beforeInput.container as Text;
-    return composerSkillQueryAt(
+    return composerQueryAt(
       root,
       textNode,
       Math.min(beforeInput.offset + beforeInput.text.length, textNode.length),
@@ -499,7 +606,7 @@ function composerSkillQueryAfterInput(
   }
   const insertedNode = beforeInput.container.childNodes[beforeInput.offset];
   if (insertedNode?.nodeType !== Node.TEXT_NODE) return null;
-  return composerSkillQueryAt(
+  return composerQueryAt(
     root,
     insertedNode as Text,
     Math.min(beforeInput.text.length, insertedNode.textContent?.length ?? 0),
@@ -524,7 +631,10 @@ function tokenBeforeComposerCaret(root: HTMLElement): HTMLElement | null {
   ) {
     candidate = candidate.previousSibling;
   }
-  return candidate instanceof HTMLElement && candidate.dataset.skillId ? candidate : null;
+  return candidate instanceof HTMLElement
+    && (candidate.dataset.skillId || candidate.dataset.composerCandidateRef)
+    ? candidate
+    : null;
 }
 
 function skillMarkdown(
@@ -838,7 +948,10 @@ function ThinkingSteps({
                           {eventStatus === "running" && <span aria-hidden="true">…</span>}
                         </span>
                         {content && (
-                          <span className="ai-chat-thinking-step-description">
+                          <span
+                            className="ai-chat-thinking-step-description"
+                            title={content}
+                          >
                             {content}
                           </span>
                         )}
@@ -1006,10 +1119,19 @@ export function AiChat({
   const [error, setError] = useState<AiChatError | null>(null);
   const [draft, setDraft] = useState("");
   const [requestedComposerText, setRequestedComposerText] = useState<string | null>(null);
+  const [requestedComposerDraft, setRequestedComposerDraft] = useState<
+    Extract<AiChatOpenThreadRequest, { composerDraft: unknown }>["composerDraft"] | null
+  >(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [skillIds, setSkillIds] = useState<string[]>([]);
-  const [skillMention, setSkillMention] = useState<ComposerSkillQuery | null>(null);
-  const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
+  const [composerQueryState, setComposerQueryState] = useState<ComposerQuery | null>(null);
+  const [composerCandidates, setComposerCandidates] = useState<ComposerCandidatesResponse | null>(null);
+  const [composerCandidatesLoading, setComposerCandidatesLoading] = useState(false);
+  const [composerCandidatesError, setComposerCandidatesError] = useState<AiChatError | null>(null);
+  const [composerRevision, setComposerRevision] = useState<string | null>(null);
+  const [selectedCandidateIndex, setSelectedCandidateIndex] = useState(0);
+  const [slashQueryBlocked, setSlashQueryBlocked] = useState(false);
+  const [composerRebindBlocked, setComposerRebindBlocked] = useState(false);
   const [composerSkillTokens, setComposerSkillTokens] = useState<ComposerSkillToken[]>([]);
   const [pendingDangerInput, setPendingDangerInput] = useState<PendingDangerInput | null>(null);
   const [unread, setUnread] = useState(false);
@@ -1024,9 +1146,10 @@ export function AiChat({
   );
   const [panelResizeEdge, setPanelResizeEdge] = useState<PanelResizeEdge | null>(null);
   const editorRef = useRef<HTMLDivElement>(null);
-  const skillMentionRangeRef = useRef<Range | null>(null);
+  const composerQueryRangeRef = useRef<Range | null>(null);
+  const dismissedComposerQueryRef = useRef<string | null>(null);
   const composerBeforeInputRef = useRef<ComposerBeforeInput | null>(null);
-  const skillMenuRef = useRef<HTMLDivElement>(null);
+  const composerMenuRef = useRef<HTMLDivElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -1034,6 +1157,7 @@ export function AiChat({
   const selectedThreadRef = useRef(selectedThreadId);
   const handledOpenThreadRequestRef = useRef<number | null>(null);
   const draftReturnThreadIdRef = useRef<string | null>(null);
+  const taskComposerDraftOriginRef = useRef<DraftThreadOrigin | null>(null);
   const panelOpenRef = useRef(panelOpen);
   const snapshotRequestRef = useRef(0);
   const snapshotLoadingRequestRef = useRef(0);
@@ -1341,6 +1465,47 @@ export function AiChat({
     return () => controller.abort();
   }, [available, catalogProjectId]);
 
+  const composerRequestQuery = useMemo(() => {
+    if (!composerQueryState) return "";
+    const escapedTrigger = composerQueryState.trigger === "/" ? "\\/" : "@";
+    const match = new RegExp(`(?:^|\\s)${escapedTrigger}([^\\s@/]*)$`).exec(draft);
+    return match?.[1] ?? composerQueryState.query;
+  }, [composerQueryState, draft]);
+
+  useEffect(() => {
+    if (!composerQueryState) {
+      setComposerCandidates(null);
+      setComposerCandidatesLoading(false);
+      setComposerCandidatesError(null);
+      return;
+    }
+    const controller = new AbortController();
+    setComposerCandidates(null);
+    setComposerCandidatesLoading(true);
+    setComposerCandidatesError(null);
+    void getAiChatComposerCandidates({
+      ...(catalogProjectId ? { projectId: catalogProjectId } : {}),
+      ...(selectedThreadId ? { threadId: selectedThreadId } : {}),
+      trigger: composerQueryState.trigger,
+      query: composerRequestQuery,
+    }, controller.signal).then(
+      (next) => {
+        if (controller.signal.aborted) return;
+        setComposerCandidates(next);
+        setComposerRevision(next.revision);
+        setComposerCandidatesLoading(false);
+      },
+      (nextError) => {
+        if (controller.signal.aborted) return;
+        if ((nextError as Error).name !== "AbortError") {
+          setComposerCandidatesError(messageFor(nextError));
+          setComposerCandidatesLoading(false);
+        }
+      },
+    );
+    return () => controller.abort();
+  }, [catalogProjectId, composerQueryState, composerRequestQuery, selectedThreadId]);
+
   const restoreDraftSettings = useCallback((thread: AiChatThread) => {
     setDraftModel(thread.model);
     setDraftEffort(thread.reasoningEffort);
@@ -1380,7 +1545,10 @@ export function AiChat({
       event.stopPropagation();
       if (typeof event.stopImmediatePropagation === "function") event.stopImmediatePropagation();
       if (dangerConfirmOpen) setPendingDangerInput(null);
-      else if (skillMention) setSkillMention(null);
+      else if (composerQueryState) {
+        dismissedComposerQueryRef.current = `${composerQueryState.trigger}${composerQueryState.query}`;
+        setComposerQueryState(null);
+      }
       else if (menu) setMenu(null);
       else if (historyOpen) setHistoryOpen(false);
       else {
@@ -1390,21 +1558,17 @@ export function AiChat({
     }
     document.addEventListener("keydown", closeWithEscape, true);
     return () => document.removeEventListener("keydown", closeWithEscape, true);
-  }, [dangerConfirmOpen, draftOrigin, historyOpen, menu, panelOpen, skillMention, threads]);
+  }, [composerQueryState, dangerConfirmOpen, draftOrigin, historyOpen, menu, panelOpen, threads]);
 
-  const visibleSkills = useMemo(
-    () => (activeCatalog?.skills ?? []).filter((skill) => (
-      skill.id !== "manage-taskboard"
-      && !skill.id.endsWith(":manage-taskboard")
-      && (
-        !skillMention?.query
-        || skill.label.toLocaleLowerCase().includes(skillMention.query)
-        || skill.id.toLocaleLowerCase().includes(skillMention.query)
-        || skill.description.toLocaleLowerCase().includes(skillMention.query)
-        || skill.path.toLocaleLowerCase().includes(skillMention.query)
-      )
-    )),
-    [activeCatalog?.skills, skillMention?.query],
+  const visibleComposerCandidates = useMemo(() => {
+    const candidates = composerCandidates?.candidates.filter((candidate) => (
+      candidate.trigger === composerQueryState?.trigger
+    )) ?? [];
+    return composerRequestQuery ? candidates.slice(0, 8) : candidates;
+  }, [composerCandidates?.candidates, composerQueryState?.trigger, composerRequestQuery]);
+  const selectableComposerCandidates = useMemo(
+    () => visibleComposerCandidates.filter((candidate) => candidate.selectable),
+    [visibleComposerCandidates],
   );
   const selectedModel = activeCatalog?.models.find((model) => model.slug === draftModel) ?? null;
   const availableSandboxes = (activeCatalog?.sandboxes ?? []).filter(isAiChatSandbox);
@@ -1414,7 +1578,7 @@ export function AiChat({
   const visibleError = error ?? catalogError;
   const composerBlocked = Boolean(
     selectedThreadId && deletingThreadId === selectedThreadId,
-  );
+  ) || composerRebindBlocked;
   const sendBlocked = loading
     || settingsSaving
     || composerBlocked
@@ -1424,7 +1588,7 @@ export function AiChat({
   const primaryAction = chatPrimaryAction(
     snapshot?.thread.status ?? "idle",
     draft,
-    sendBlocked,
+    sendBlocked || (snapshot?.thread.status !== "running" && slashQueryBlocked),
     attachments.length > 0,
   );
   const launcherState = unread ? "unread" : "idle";
@@ -1440,21 +1604,25 @@ export function AiChat({
     : null;
 
   useEffect(() => {
-    setSelectedSkillIndex(0);
-  }, [skillMention?.query]);
+    setSelectedCandidateIndex(0);
+  }, [composerQueryState?.trigger, composerRequestQuery]);
 
   useEffect(() => {
-    setSelectedSkillIndex((current) => (
-      visibleSkills.length === 0 ? 0 : Math.min(current, visibleSkills.length - 1)
+    setSelectedCandidateIndex((current) => (
+      selectableComposerCandidates.length === 0
+        ? 0
+        : Math.min(current, selectableComposerCandidates.length - 1)
     ));
-  }, [visibleSkills.length]);
+  }, [selectableComposerCandidates.length]);
 
   useEffect(() => {
-    const option = skillMenuRef.current?.querySelector<HTMLElement>(
-      `[data-skill-index="${selectedSkillIndex}"]`,
+    const selected = selectableComposerCandidates[selectedCandidateIndex];
+    if (!selected) return;
+    const option = composerMenuRef.current?.querySelector<HTMLElement>(
+      `[data-candidate-ref="${CSS.escape(selected.candidateRef)}"]`,
     );
     option?.scrollIntoView({ block: "nearest" });
-  }, [selectedSkillIndex, skillMention?.query, visibleSkills.length]);
+  }, [selectedCandidateIndex, selectableComposerCandidates]);
 
   useEffect(() => {
     if (attachmentBlocked) setAttachmentDragActive(false);
@@ -1467,17 +1635,24 @@ export function AiChat({
     setAttachments([]);
     setSkillIds([]);
     setComposerSkillTokens([]);
-    setSkillMention(null);
+    setComposerQueryState(null);
+    setComposerCandidates(null);
+    setComposerRevision(null);
+    setSlashQueryBlocked(false);
+    composerQueryRangeRef.current = null;
+    dismissedComposerQueryRef.current = null;
     setPendingDangerInput(null);
     setAttachmentDragActive(false);
     setRequestedComposerText(null);
-    skillMentionRangeRef.current = null;
+    setRequestedComposerDraft(null);
+    setComposerRebindBlocked(false);
+    taskComposerDraftOriginRef.current = null;
   }
 
   useEffect(() => {
     if (!available || !openThreadRequest) return;
     if (handledOpenThreadRequestRef.current === openThreadRequest.requestId) return;
-    if ("composerText" in openThreadRequest) {
+    if ("projectId" in openThreadRequest) {
       handledOpenThreadRequestRef.current = openThreadRequest.requestId;
       if (!draftOrigin) draftReturnThreadIdRef.current = selectedThreadRef.current;
       resetComposer();
@@ -1485,12 +1660,29 @@ export function AiChat({
         projectId: openThreadRequest.projectId,
         issueId: openThreadRequest.issueId,
       });
+      taskComposerDraftOriginRef.current = {
+        projectId: openThreadRequest.projectId,
+        issueId: openThreadRequest.issueId,
+      };
       setSnapshot(null);
       selectThread(null);
       setHistoryOpen(false);
       setMenu(null);
-      setError(null);
-      setRequestedComposerText(openThreadRequest.composerText);
+      const composerDraft = "composerDraft" in openThreadRequest
+        ? openThreadRequest.composerDraft
+        : null;
+      setError(composerDraft && !composerDraft.ready
+        ? text(
+            "议题中的 Agent 或 Skill 已失效，请返回议题重新选择后再发送。",
+            "An Agent or Skill in this issue is unavailable. Re-select it in the issue before sending.",
+          )
+        : null);
+      setRequestedComposerText("composerText" in openThreadRequest
+        ? openThreadRequest.composerText
+        : null);
+      setRequestedComposerDraft(composerDraft);
+      setComposerRebindBlocked(composerDraft?.ready === false);
+      if (composerDraft?.ready) setComposerRevision(composerDraft.revision);
       setPanelOpen(true);
       return;
     }
@@ -1536,6 +1728,62 @@ export function AiChat({
     selection?.removeAllRanges();
     selection?.addRange(range);
   }, [panelOpen, requestedComposerText]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!panelOpen || requestedComposerDraft === null || !editor) return;
+    const nextTokens: ComposerSkillToken[] = [];
+    const content = editor.ownerDocument.createDocumentFragment();
+    for (const node of requestedComposerDraft.document.nodes) {
+      if (node.type === "text") {
+        content.append(editor.ownerDocument.createTextNode(node.text));
+        continue;
+      }
+      const unavailable = node.type === "persistedReference" || node.type === "unsupportedReference";
+      const kind = node.type === "unsupportedReference"
+        ? undefined
+        : node.type === "persistedReference"
+          ? node.referenceKind
+          : node.type;
+      const tokenElement = editor.ownerDocument.createElement("span");
+      tokenElement.className = "ai-chat-composer-skill-token";
+      tokenElement.dataset.composerLabel = node.label;
+      if (kind) tokenElement.dataset.composerKind = kind;
+      if (!unavailable) tokenElement.dataset.composerCandidateRef = node.candidateRef;
+      tokenElement.contentEditable = "false";
+      tokenElement.title = unavailable
+        ? text(`${node.label}（不可用）`, `${node.label} (unavailable)`)
+        : node.label;
+      content.append(tokenElement, editor.ownerDocument.createTextNode("\u200B"));
+      nextTokens.push({
+        key: crypto.randomUUID(),
+        candidateRef: node.type === "unsupportedReference"
+          ? node.referenceUri
+          : node.type === "persistedReference"
+            ? node.referenceKey
+            : node.candidateRef,
+        label: node.label,
+        kind,
+        unavailable,
+        element: tokenElement,
+      });
+    }
+    editor.replaceChildren(content);
+    const serialized = serializeComposer(editor);
+    setDraft(serialized.message || requestedComposerDraft.document.nodes.map((node) => (
+      node.type === "text" ? node.text : node.label
+    )).join(""));
+    setSkillIds(serialized.skillIds);
+    setComposerSkillTokens(nextTokens);
+    setRequestedComposerDraft(null);
+    editor.focus();
+    const range = editor.ownerDocument.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    const selection = editor.ownerDocument.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }, [panelOpen, requestedComposerDraft, text]);
 
   function restorePersistedConversationFromDraft() {
     if (!draftOrigin) return;
@@ -1743,22 +1991,35 @@ export function AiChat({
     };
   }
 
-  function updateComposerSkillQuery(fromInput = false) {
+  function updateComposerQuery(fromInput = false) {
     const editor = editorRef.current;
     if (!editor) return;
     if (editor.ownerDocument.activeElement !== editor) {
       composerBeforeInputRef.current = null;
-      skillMentionRangeRef.current = null;
-      setSkillMention(null);
+      composerQueryRangeRef.current = null;
+      setComposerQueryState(null);
       return;
     }
     const beforeInput = fromInput ? composerBeforeInputRef.current : null;
-    const next = (
-      beforeInput ? composerSkillQueryAfterInput(editor, beforeInput) : null
-    ) ?? composerSkillQuery(editor);
+    const detected = (fromInput ? composerQueryAtEnd(editor) : composerQuery(editor)) ?? (
+      beforeInput ? composerQueryAfterInput(editor, beforeInput) : null
+    );
+    const textMatch = /(?:^|\s)([@/])([^\s@/]*)$/.exec(
+      (editor.textContent ?? "").replaceAll("\u200B", ""),
+    );
+    const next = detected && textMatch?.[1] === detected.trigger
+      ? { ...detected, query: textMatch[2] }
+      : detected;
     composerBeforeInputRef.current = null;
-    skillMentionRangeRef.current = next?.range ?? null;
-    setSkillMention(next ? { query: next.query } : null);
+    if (fromInput) dismissedComposerQueryRef.current = null;
+    const queryKey = next ? `${next.trigger}${next.query}` : null;
+    composerQueryRangeRef.current = next?.range ?? null;
+    setSlashQueryBlocked(next?.trigger === "/");
+    setComposerQueryState(
+      next && dismissedComposerQueryRef.current !== queryKey
+        ? { trigger: next.trigger, query: next.query }
+        : null,
+    );
   }
 
   function removeComposerSkillToken(element: HTMLElement) {
@@ -1821,7 +2082,12 @@ export function AiChat({
       tokenElement.contentEditable = "false";
       tokenElement.title = skillDisplayName(skill);
       content.append(tokenElement, editor.ownerDocument.createTextNode("\u200B"));
-      newTokens.push({ key: crypto.randomUUID(), id: skill.id, element: tokenElement });
+      newTokens.push({
+        key: crypto.randomUUID(),
+        candidateRef: skill.id,
+        label: skillDisplayName(skill),
+        element: tokenElement,
+      });
       skillIndex += 1;
       messageOffset = markerOffset + SKILL_MARKER.length;
     }
@@ -1843,17 +2109,114 @@ export function AiChat({
     selection?.addRange(range);
     syncComposerState();
     setComposerSkillTokens((current) => [...current, ...newTokens]);
-    setSkillMention(null);
-    skillMentionRangeRef.current = null;
+    setComposerQueryState(null);
+    composerQueryRangeRef.current = null;
     editor.focus();
     return true;
   }
 
-  function selectSkill(skill: AiChatSkill) {
+  function selectComposerSkill(candidate: ComposerSkillCandidate) {
     const editor = editorRef.current;
-    const range = skillMentionRangeRef.current;
-    if (!skillMention || !editor || !range) return;
-    insertComposerFragment({ message: SKILL_MARKER, skillIds: [skill.id] }, range);
+    const range = editor ? composerQueryAtEnd(editor)?.range ?? composerQueryRangeRef.current : null;
+    if (!composerQueryState || !editor || !range) return;
+    const insertedDocument = insertComposerSkill(createComposerDocument(), 0, 0, candidate);
+    const skillNode = insertedDocument.nodes[0];
+    if (!skillNode || skillNode.type !== "skill") return;
+    const tokenElement = editor.ownerDocument.createElement("span");
+    tokenElement.className = "ai-chat-composer-skill-token";
+    tokenElement.dataset.composerCandidateRef = skillNode.candidateRef;
+    tokenElement.dataset.composerLabel = skillNode.label;
+    tokenElement.dataset.composerKind = "skill";
+    tokenElement.contentEditable = "false";
+    tokenElement.title = skillNode.label;
+    const sentinel = editor.ownerDocument.createTextNode("\u200B");
+    range.deleteContents();
+    range.insertNode(sentinel);
+    range.insertNode(tokenElement);
+    range.setStart(sentinel, sentinel.length);
+    range.collapse(true);
+    editor.ownerDocument.getSelection()?.removeAllRanges();
+    editor.ownerDocument.getSelection()?.addRange(range);
+    setComposerSkillTokens((current) => [...current, {
+      key: crypto.randomUUID(),
+      candidateRef: skillNode.candidateRef,
+      label: skillNode.label,
+      kind: "skill",
+      element: tokenElement,
+    }]);
+    setComposerRevision(composerCandidates?.revision ?? null);
+    setComposerQueryState(null);
+    setSlashQueryBlocked(false);
+    composerQueryRangeRef.current = null;
+    dismissedComposerQueryRef.current = null;
+    syncComposerState();
+    editor.focus();
+  }
+
+  function selectComposerAgent(candidate: ComposerAgentCandidate) {
+    const editor = editorRef.current;
+    const range = editor ? composerQueryAtEnd(editor)?.range ?? composerQueryRangeRef.current : null;
+    if (!composerQueryState || !editor || !range) return;
+    const insertedDocument = insertComposerAgent(createComposerDocument(), 0, 0, candidate);
+    const agentNode = insertedDocument.nodes[0];
+    if (!agentNode || agentNode.type !== "agent") return;
+    const tokenElement = editor.ownerDocument.createElement("span");
+    tokenElement.className = "ai-chat-composer-skill-token";
+    tokenElement.dataset.composerCandidateRef = agentNode.candidateRef;
+    tokenElement.dataset.composerLabel = agentNode.label;
+    tokenElement.dataset.composerKind = "agent";
+    tokenElement.contentEditable = "false";
+    tokenElement.title = agentNode.label;
+    const sentinel = editor.ownerDocument.createTextNode("\u200B");
+    range.deleteContents();
+    range.insertNode(sentinel);
+    range.insertNode(tokenElement);
+    range.setStart(sentinel, sentinel.length);
+    range.collapse(true);
+    editor.ownerDocument.getSelection()?.removeAllRanges();
+    editor.ownerDocument.getSelection()?.addRange(range);
+    setComposerSkillTokens((current) => [...current, {
+      key: crypto.randomUUID(),
+      candidateRef: agentNode.candidateRef,
+      label: agentNode.label,
+      kind: "agent",
+      element: tokenElement,
+    }]);
+    setComposerRevision(composerCandidates?.revision ?? null);
+    setComposerQueryState(null);
+    setSlashQueryBlocked(false);
+    composerQueryRangeRef.current = null;
+    dismissedComposerQueryRef.current = null;
+    syncComposerState();
+    editor.focus();
+  }
+
+  function selectSlashAction(candidate: ComposerSlashActionCandidate) {
+    const editor = editorRef.current;
+    const range = editor ? composerQueryAtEnd(editor)?.range ?? composerQueryRangeRef.current : null;
+    if (!composerQueryState || !editor || !range) return;
+    range.deleteContents();
+    setComposerQueryState(null);
+    setSlashQueryBlocked(false);
+    composerQueryRangeRef.current = null;
+    dismissedComposerQueryRef.current = null;
+    syncComposerState();
+    if (candidate.dispatch.handlerId === "new-conversation") beginNewConversation();
+    else if (candidate.dispatch.handlerId === "open-model-menu") setMenu("model-list");
+    else if (candidate.dispatch.handlerId === "open-reasoning-menu") setMenu("effort-list");
+    else if (candidate.dispatch.handlerId === "compact-conversation" && selectedThreadId) {
+      setLoading(true);
+      void compactAiChatThread(selectedThreadId).then((thread) => {
+        replaceThread(thread);
+        setError(null);
+      }, (nextError) => setError(messageFor(nextError))).finally(() => setLoading(false));
+    }
+  }
+
+  function selectComposerCandidate(candidate: ComposerCandidate) {
+    if (candidate.kind === "skill") selectComposerSkill(candidate);
+    else if (candidate.kind === "agent") selectComposerAgent(candidate);
+    else selectSlashAction(candidate);
   }
 
   function realSkillIdsForMessage(): string[] {
@@ -1866,10 +2229,54 @@ export function AiChat({
     boundSkillIds?: string[],
     clearSubmittedDraft = true,
     boundAttachments?: AiChatAttachmentInput[],
+    boundComposerDocument?: ComposerDocument,
+    boundComposerRevision?: string,
   ) {
     if (sendBlocked) return;
+    if (boundSkillIds === undefined && slashQueryBlocked) return;
     const trimmed = message.trim();
     const submittedSkillIds = boundSkillIds ?? [...realSkillIdsForMessage()];
+    let currentComposerDocument = boundComposerDocument
+      ?? (editorRef.current ? serializeComposerDocumentFromDom(editorRef.current) : undefined);
+    let currentComposerRevision = boundComposerRevision ?? composerRevision ?? undefined;
+    const hasStructuredReference = currentComposerDocument?.nodes.some((node) => (
+      node.type === "skill" || node.type === "agent"
+    )) ?? false;
+    const isTaskOriginPlainTextDraft = Boolean(
+      taskComposerDraftOriginRef.current
+      && currentComposerDocument?.nodes.every((node) => node.type === "text"),
+    );
+    if (isTaskOriginPlainTextDraft) {
+      if (!boundComposerDocument) currentComposerDocument = createComposerDocument(message);
+      if (!currentComposerRevision) {
+        try {
+          const candidates = await getAiChatComposerCandidates({
+            projectId: taskComposerDraftOriginRef.current?.projectId,
+            trigger: "@",
+            query: "",
+          });
+          if (!candidates.revision.trim()) {
+            throw new Error(text(
+              "补全来源无效，请重新打开任务草稿",
+              "The completion source is invalid. Reopen the task draft.",
+            ));
+          }
+          currentComposerRevision = candidates.revision;
+          setComposerRevision(candidates.revision);
+        } catch (nextError) {
+          setError(messageFor(nextError));
+          return;
+        }
+      }
+    }
+    const useComposerTurn = hasStructuredReference || isTaskOriginPlainTextDraft;
+    if (useComposerTurn && !currentComposerRevision) {
+      setError(text(
+        "补全来源已失效，请重新选择 Skill",
+        "The completion source is stale. Select the Skill again.",
+      ));
+      return;
+    }
     const messageAttachments = boundAttachments ?? attachments.map((attachment) => ({
       filename: attachment.filename,
       contentType: attachment.contentType,
@@ -1883,12 +2290,16 @@ export function AiChat({
       setPendingDangerInput({
         message: trimmed,
         skillIds: submittedSkillIds,
+        ...(useComposerTurn && currentComposerDocument && currentComposerRevision ? {
+          composerDocument: currentComposerDocument,
+          composerRevision: currentComposerRevision,
+        } : {}),
         attachments: messageAttachments,
         clearSubmittedDraft,
       });
       return;
     }
-    if (creatingThread && clearSubmittedDraft) resetComposer();
+    if (creatingThread && clearSubmittedDraft && !useComposerTurn) resetComposer();
     if (!thread) thread = await createThreadForDraftOrigin();
     if (!thread) return;
     const messageSkillIds = (
@@ -1897,16 +2308,28 @@ export function AiChat({
     setPendingDangerInput(null);
     setError(null);
     try {
-      const turnInput = buildTurnInput(
-        trimmed,
-        messageSkillIds,
-        dangerConfirmed,
-        messageAttachments,
-      );
-      if (clearSubmittedDraft && !creatingThread) {
+      const composerTurnInput = useComposerTurn
+        && currentComposerDocument
+        && currentComposerRevision
+        ? buildComposerTurnInput(
+            currentComposerDocument,
+            currentComposerRevision,
+            dangerConfirmed,
+            messageAttachments,
+          )
+        : null;
+      if (clearSubmittedDraft && !creatingThread && !composerTurnInput) {
         resetComposer();
       }
-      const run = await startAiChatTurn(thread.id, turnInput);
+      const run = composerTurnInput
+        ? await startAiChatComposerTurn(thread.id, composerTurnInput)
+        : await startAiChatTurn(thread.id, buildTurnInput(
+            trimmed,
+            messageSkillIds,
+            dangerConfirmed,
+            messageAttachments,
+          ));
+      if (clearSubmittedDraft && composerTurnInput) resetComposer();
       observedRunStatusesRef.current.set(run.id, run.status);
       setSnapshot((current) => current?.thread.id === thread.id ? {
           ...current,
@@ -2071,8 +2494,8 @@ export function AiChat({
       caret.collapse(false);
       selection?.addRange(caret);
     }
-    setSkillMention(null);
-    skillMentionRangeRef.current = null;
+    setComposerQueryState(null);
+    composerQueryRangeRef.current = null;
     editor.focus();
   }
 
@@ -2127,21 +2550,36 @@ export function AiChat({
         return;
       }
     }
-    if (skillMention && visibleSkills.length > 0 && event.key === "ArrowDown") {
+    const navigationDirection = event.key === "ArrowDown" || (event.ctrlKey && event.key.toLocaleLowerCase() === "n")
+      ? 1
+      : event.key === "ArrowUp" || (event.ctrlKey && event.key.toLocaleLowerCase() === "p")
+        ? -1
+        : 0;
+    if (composerQueryState && navigationDirection > 0) {
       event.preventDefault();
-      setSelectedSkillIndex((current) => (current + 1) % visibleSkills.length);
+      if (selectableComposerCandidates.length > 0) {
+        setSelectedCandidateIndex((current) => (
+          (current + 1) % selectableComposerCandidates.length
+        ));
+      }
       return;
     }
-    if (skillMention && visibleSkills.length > 0 && event.key === "ArrowUp") {
+    if (composerQueryState && navigationDirection < 0) {
       event.preventDefault();
-      setSelectedSkillIndex((current) => (
-        (current - 1 + visibleSkills.length) % visibleSkills.length
-      ));
+      if (selectableComposerCandidates.length > 0) {
+        setSelectedCandidateIndex((current) => (
+          (current - 1 + selectableComposerCandidates.length) % selectableComposerCandidates.length
+        ));
+      }
       return;
     }
-    if (event.key === "Enter" && skillMention && visibleSkills[selectedSkillIndex]) {
+    if (
+      (event.key === "Enter" || event.key === "Tab")
+      && composerQueryState
+    ) {
       event.preventDefault();
-      selectSkill(visibleSkills[selectedSkillIndex]);
+      const selected = selectableComposerCandidates[selectedCandidateIndex];
+      if (selected) selectComposerCandidate(selected);
       return;
     }
     if (event.key === "Enter") {
@@ -2389,11 +2827,17 @@ export function AiChat({
                 role="textbox"
                 aria-label={text("发送给 Codex 的消息", "Message to Codex")}
                 aria-multiline="true"
+                aria-autocomplete="list"
+                aria-controls={composerQueryState ? "ai-chat-composer-candidates" : undefined}
+                aria-expanded={Boolean(composerQueryState)}
                 suppressContentEditableWarning
                 onBeforeInput={(event) => rememberComposerBeforeInput(event.nativeEvent as InputEvent)}
-                onInput={() => {
+                onInput={(event) => {
                   syncComposerState();
-                  updateComposerSkillQuery(true);
+                  if (!event.nativeEvent.isComposing) {
+                    updateComposerQuery(true);
+                    requestAnimationFrame(() => updateComposerQuery());
+                  }
                 }}
                 onClick={(event) => {
                   const token = (event.target as HTMLElement).closest<HTMLElement>(
@@ -2403,7 +2847,7 @@ export function AiChat({
                     removeComposerSkillToken(token);
                     return;
                   }
-                  updateComposerSkillQuery();
+                  updateComposerQuery();
                 }}
                 onKeyDown={handleComposerKeyDown}
                 onKeyUp={(event) => {
@@ -2412,62 +2856,102 @@ export function AiChat({
                     || event.key === "ArrowRight"
                     || event.key === "Home"
                     || event.key === "End"
-                    || (!skillMention && (
+                    || (!composerQueryState && (
                       event.key === "ArrowUp"
                       || event.key === "ArrowDown"
                     ))
-                  ) updateComposerSkillQuery();
+                  ) updateComposerQuery();
                 }}
-                onCompositionEnd={() => updateComposerSkillQuery()}
-                onBlur={() => setSkillMention(null)}
+                onCompositionEnd={() => updateComposerQuery()}
+                onBlur={() => setComposerQueryState(null)}
                 onCopy={handleComposerCopy}
                 onCut={handleComposerCut}
                 onPaste={handleComposerPaste}
               />
               {composerSkillTokens.map((token) => {
-                const skill = activeCatalog?.skills.find((candidate) => candidate.id === token.id);
                 return createPortal(
                   <button
                     type="button"
                     aria-label={text(
-                      `移除 Skill ${skill ? skillDisplayName(skill) : token.id}`,
-                      `Remove Skill ${skill ? skillDisplayName(skill) : token.id}`,
+                      `移除${token.kind === "agent" ? " Agent" : " Skill"} ${token.label}`,
+                      `Remove ${token.kind === "agent" ? "Agent" : "Skill"} ${token.label}`,
                     )}
                     onMouseDown={(event) => event.preventDefault()}
                     onClick={() => removeComposerSkillToken(token.element)}
+                    disabled={token.unavailable}
                   >
-                    <SkillReference skill={skill} skillId={token.id} />
+                    <span className="ai-chat-skill-reference">
+                      <LinearIcon name={token.kind === "agent" ? "conversation" : "project"} />
+                      <span>{token.label}</span>
+                    </span>
                   </button>,
                   token.element,
                   token.key,
                 );
               })}
-              {skillMention && visibleSkills.length > 0 && (
+              {composerQueryState && (
                 <div
-                  ref={skillMenuRef}
+                  ref={composerMenuRef}
+                  id="ai-chat-composer-candidates"
                   className="ai-chat-skill-menu"
                   role="listbox"
-                  aria-label={text("可用 Skill", "Available Skills")}
+                  aria-label={text("Composer 补全", "Composer completions")}
+                  aria-busy={composerCandidatesLoading}
                 >
-                  {visibleSkills.map((skill, index) => (
-                    <button
-                      className={index === selectedSkillIndex ? "is-selected" : undefined}
-                      type="button"
-                      role="option"
-                      aria-selected={index === selectedSkillIndex}
-                      data-skill-index={index}
-                      key={skill.id}
-                      onPointerDown={(event) => event.preventDefault()}
-                      onPointerEnter={() => setSelectedSkillIndex(index)}
-                      onClick={() => selectSkill(skill)}
-                    >
-                      <LinearIcon name="project" />
-                      <span>
-                        <strong>{skillDisplayName(skill)}</strong>
-                        {skill.description && <small>{skill.description}</small>}
-                      </span>
-                    </button>
-                  ))}
+                  {composerCandidatesLoading && (
+                    <div className="ai-chat-composer-candidate-state" role="status">
+                      <span className="ai-chat-spinner" />
+                      {text("正在读取补全…", "Loading completions…")}
+                    </div>
+                  )}
+                  {!composerCandidatesLoading && composerCandidatesError && (
+                    <div className="ai-chat-composer-candidate-state is-error" role="alert">
+                      {composerCandidatesError === AI_CHAT_UNAVAILABLE_ERROR
+                        ? text("补全来源暂时不可用", "Completion sources are temporarily unavailable.")
+                        : composerCandidatesError}
+                    </div>
+                  )}
+                  {!composerCandidatesLoading && !composerCandidatesError && visibleComposerCandidates.map((candidate) => {
+                    const selectableIndex = selectableComposerCandidates.findIndex((item) => (
+                      item.candidateRef === candidate.candidateRef
+                    ));
+                    const selected = selectableIndex === selectedCandidateIndex && selectableIndex >= 0;
+                    const disabled = !candidate.selectable;
+                    return (
+                      <button
+                        className={selected ? "is-selected" : undefined}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        aria-disabled={disabled}
+                        disabled={disabled}
+                        data-candidate-ref={candidate.candidateRef}
+                        key={candidate.candidateRef}
+                        onPointerDown={(event) => event.preventDefault()}
+                        onPointerEnter={() => {
+                          if (selectableIndex >= 0) setSelectedCandidateIndex(selectableIndex);
+                        }}
+                        onClick={() => {
+                          selectComposerCandidate(candidate);
+                        }}
+                      >
+                        <LinearIcon name={candidate.kind === "skill" ? "project" : candidate.kind === "agent" ? "conversation" : "terminal"} />
+                        <span>
+                          <strong>{candidate.kind === "slashAction" ? candidate.command : candidate.label}</strong>
+                          <small>{candidate.description ?? candidate.group}</small>
+                          {disabled && <em>{text("当前客户端未接入执行", "No client handler available")}</em>}
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {!composerCandidatesLoading
+                    && !composerCandidatesError
+                    && visibleComposerCandidates.length === 0
+                    && composerCandidates && (
+                      <div className="ai-chat-composer-candidate-state" role="status">
+                        {text("没有匹配的可选项", "No matching completions")}
+                      </div>
+                    )}
                 </div>
               )}
             </div>
@@ -2712,6 +3196,8 @@ export function AiChat({
                         pendingDangerInput.skillIds,
                         pendingDangerInput.clearSubmittedDraft,
                         pendingDangerInput.attachments,
+                        pendingDangerInput.composerDocument,
+                        pendingDangerInput.composerRevision,
                       );
                     }}
                   >

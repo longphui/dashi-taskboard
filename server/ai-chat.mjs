@@ -4,7 +4,13 @@ import path from "node:path";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
 import { ApiError } from "./database.mjs";
-import { discoverAiCatalog, resolveAiWorkspace } from "./ai-chat-catalog.mjs";
+import {
+  ComposerCatalog,
+  discoverAiCatalog,
+  loadSlashCommands,
+  resolveAiWorkspace,
+} from "./ai-chat-catalog.mjs";
+import { CodexAppServer } from "./codex-app-server.mjs";
 import {
   buildCodexArgs,
   buildCodexPrompt,
@@ -14,6 +20,7 @@ import {
 
 const SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const ERROR_CONTENT_LIMIT = 65_536;
+const AGENT_DISPATCH_PROTOCOL = "taskboard.agent.v1";
 const CODEX_IMAGE_TYPES = new Set([
   "image/gif",
   "image/jpeg",
@@ -24,6 +31,14 @@ const CODEX_IMAGE_TYPES = new Set([
 function cappedError(value) {
   const message = value instanceof Error ? value.message : String(value ?? "");
   return message.slice(0, ERROR_CONTENT_LIMIT);
+}
+
+function agentDispatchText(agent) {
+  return [
+    `Taskboard private agent dispatch (${AGENT_DISPATCH_PROTOCOL}):`,
+    `Use the configured Taskboard agent ${JSON.stringify(agent.name)} (id ${JSON.stringify(agent.id)}) for this request.`,
+    "This is Taskboard product-private routing context, not a Codex App Server UserInput type.",
+  ].join("\n");
 }
 
 function signalProcessGroup(child, signal) {
@@ -37,6 +52,75 @@ function wait(milliseconds) {
   });
 }
 
+function appServerThreadSettings(thread, resolved) {
+  const dangerous = thread.sandbox === "danger-full-access";
+  return {
+    model: thread.model,
+    cwd: resolved.workspacePath,
+    runtimeWorkspaceRoots: [resolved.workspacePath, ...resolved.addDirectories],
+    approvalPolicy: dangerous ? "never" : "on-request",
+    ...(dangerous
+      ? {}
+      : { approvalsReviewer: thread.sandbox === "read-only" ? "user" : "auto_review" }),
+    sandbox: thread.sandbox,
+  };
+}
+
+function normalizedAppServerItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const itemId = typeof item.id === "string" ? item.id.slice(0, ERROR_CONTENT_LIMIT) : "";
+  const baseData = { status: item.status ?? "completed", ...(itemId ? { itemId } : {}) };
+  if (item.type === "agentMessage") {
+    return {
+      type: "agent_message",
+      role: "assistant",
+      content: cappedError(item.text),
+      data: baseData,
+    };
+  }
+  if (item.type === "commandExecution") {
+    return {
+      type: "command_execution",
+      role: "activity",
+      content: cappedError(item.command),
+      data: {
+        ...baseData,
+        command: cappedError(item.command),
+        ...(typeof item.aggregatedOutput === "string"
+          ? { output: cappedError(item.aggregatedOutput) }
+          : {}),
+        ...(Number.isInteger(item.exitCode) ? { exitCode: item.exitCode } : {}),
+      },
+    };
+  }
+  if (item.type === "fileChange") {
+    const files = Array.isArray(item.changes)
+      ? item.changes.flatMap((change) => (
+        typeof change?.path === "string" ? [change.path.slice(0, ERROR_CONTENT_LIMIT)] : []
+      ))
+      : [];
+    return {
+      type: "file_change",
+      role: "activity",
+      content: files.join("\n").slice(0, ERROR_CONTENT_LIMIT),
+      data: { ...baseData, files },
+    };
+  }
+  if (item.type === "mcpToolCall") {
+    return {
+      type: "mcp_tool_call",
+      role: item.error ? "error" : "activity",
+      content: `${item.server ?? ""}.${item.tool ?? ""}`.replace(/^\.|\.$/g, ""),
+      data: {
+        ...baseData,
+        ...(typeof item.server === "string" ? { server: item.server } : {}),
+        ...(typeof item.tool === "string" ? { tool: item.tool } : {}),
+      },
+    };
+  }
+  return null;
+}
+
 export class AiChatService {
   constructor(options) {
     this.database = options.database;
@@ -45,6 +129,14 @@ export class AiChatService {
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
     this.killGraceMs = options.killGraceMs ?? 1_000;
+    this.appServer = options.appServer ?? new CodexAppServer({
+      executable: this.codexExecutable,
+      processEnv: this.processEnv,
+    });
+    this.composerCatalog = options.composerCatalog ?? new ComposerCatalog({
+      appServer: this.appServer,
+      issueSlashCommands: () => loadSlashCommands(),
+    });
     this.resolveContext = options.resolveContext ?? (async (projectId, issueId) => {
       const resolved = await resolveAiWorkspace(projectId, this.codexStatePath, this.database);
       let issue;
@@ -63,6 +155,9 @@ export class AiChatService {
     this.active = new Map();
     this.listeners = new Map();
     this.completions = new Map();
+    this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
+      this.#handleAppServerNotification(notification);
+    });
   }
 
   listThreads() {
@@ -122,6 +217,80 @@ export class AiChatService {
   async getCatalog(projectId, resolvedContext) {
     const resolved = resolvedContext ?? await this.resolveContext(projectId);
     return this.#catalogForWorkspace(resolved.workspacePath);
+  }
+
+  async getComposerCandidates({ projectId, threadId, trigger, query }) {
+    let thread;
+    if (threadId !== undefined) {
+      try {
+        thread = this.getThread(threadId);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === "AI_CHAT_THREAD_NOT_FOUND") {
+          throw new ApiError(
+            400,
+            "INVALID_COMPOSER_QUERY",
+            "Composer thread does not exist",
+          );
+        }
+        throw error;
+      }
+      if (projectId !== undefined && thread.origin.projectId !== projectId) {
+        throw new ApiError(
+          400,
+          "INVALID_COMPOSER_QUERY",
+          "Composer thread does not belong to the selected project",
+        );
+      }
+      projectId = thread.origin.projectId;
+    }
+
+    if (projectId === undefined) {
+      const response = await this.composerCatalog.candidates({ workspacePath: null, trigger, query });
+      return { ...response, candidates: response.candidates.filter((candidate) => (
+        candidate.dispatch?.handlerId !== "compact-conversation"
+      )) };
+    }
+
+    let resolved;
+    try {
+      resolved = await this.resolveContext(projectId, thread?.origin.issueId);
+    } catch (error) {
+      if (error instanceof ApiError && ["PROJECT_NOT_FOUND", "AI_CHAT_ISSUE_NOT_FOUND"].includes(error.code)) {
+        throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer project is invalid");
+      }
+      throw error;
+    }
+    if (thread && resolved.workspacePath !== thread.origin.workspacePath) {
+      throw new ApiError(
+        400,
+        "INVALID_COMPOSER_QUERY",
+        "Composer thread workspace no longer matches the selected project",
+      );
+    }
+    const response = await this.composerCatalog.candidates({
+      workspacePath: resolved.workspacePath,
+      trigger,
+      query,
+    });
+    return {
+      ...response,
+      candidates: response.candidates.filter((candidate) => (
+        candidate.dispatch?.handlerId !== "compact-conversation"
+        || (thread?.codexThreadId && thread.status !== "running")
+      )),
+    };
+  }
+
+  async compactThread(threadId) {
+    const thread = this.getThread(threadId);
+    if (thread.status === "running") {
+      throw new ApiError(409, "AI_CHAT_THREAD_RUNNING", "Cannot compact a running conversation");
+    }
+    if (!thread.codexThreadId) {
+      throw new ApiError(409, "AI_CHAT_THREAD_NOT_STARTED", "Conversation has not started");
+    }
+    await this.appServer.compactThread(thread.codexThreadId);
+    return this.getThread(threadId);
   }
 
   async createThread(input) {
@@ -195,6 +364,9 @@ export class AiChatService {
         "THREAD_BUSY",
         `AI chat thread '${threadId}' has a running turn`,
       );
+    }
+    if (input?.contractVersion === "composer.v1") {
+      return this.#startComposerTurn(thread, input);
     }
     this.#validateTurnInput(input);
     if (thread.sandbox === "danger-full-access" && input.dangerFullAccessConfirmed !== true) {
@@ -382,6 +554,22 @@ export class AiChatService {
     }
 
     active.interrupted = true;
+    if (active.kind === "app-server") {
+      if (active.turnId) {
+        try {
+          await this.appServer.interruptTurn({
+            threadId: active.appServerThreadId,
+            turnId: active.turnId,
+          });
+        } catch {}
+      }
+      const completion = this.completions.get(runId);
+      if (completion) {
+        await Promise.race([completion.catch(() => {}), wait(this.killGraceMs + 25)]);
+      }
+      if (this.active.has(runId)) await this.#finishAppServerRun(active, "interrupted");
+      return this.getRun(runId);
+    }
     signalProcessGroup(active.child, "SIGTERM");
     const timer = setTimeout(() => {
       if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
@@ -399,7 +587,16 @@ export class AiChatService {
     const entries = [...this.active.entries()];
     for (const [, active] of entries) {
       active.interrupted = true;
-      signalProcessGroup(active.child, "SIGTERM");
+      if (active.kind === "app-server") {
+        if (active.turnId) {
+          void this.appServer.interruptTurn({
+            threadId: active.appServerThreadId,
+            turnId: active.turnId,
+          }).catch(() => {});
+        }
+      } else {
+        signalProcessGroup(active.child, "SIGTERM");
+      }
     }
 
     const completions = entries
@@ -409,10 +606,25 @@ export class AiChatService {
       const settled = Promise.allSettled(completions);
       await Promise.race([settled, wait(this.killGraceMs)]);
       for (const [runId, active] of entries) {
-        if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
+        if (active.kind !== "app-server" && this.active.has(runId)) {
+          signalProcessGroup(active.child, "SIGKILL");
+        }
+      }
+      for (const [, active] of entries) {
+        if (active.kind === "app-server" && this.active.has(active.run.id)) {
+          await this.#finishAppServerRun(active, "interrupted");
+        }
       }
       await settled;
     }
+    for (const [, active] of entries) {
+      if (active.kind === "app-server" && this.active.has(active.run.id)) {
+        await this.#finishAppServerRun(active, "interrupted");
+      }
+    }
+    this.unsubscribeAppServer();
+    this.composerCatalog.close();
+    await this.appServer.close();
     this.listeners.clear();
   }
 
@@ -481,6 +693,255 @@ export class AiChatService {
         "INVALID_SKILL",
         "'skillIds' must contain at most 20 skill ids",
       );
+    }
+  }
+
+  async #startComposerTurn(thread, input) {
+    if (thread.sandbox === "danger-full-access" && input.dangerFullAccessConfirmed !== true) {
+      throw new ApiError(
+        400,
+        "DANGER_CONFIRMATION_REQUIRED",
+        "danger-full-access must be confirmed for every turn",
+      );
+    }
+
+    const resolved = await this.resolveContext(
+      thread.origin.projectId,
+      thread.origin.issueId,
+    );
+    thread = this.getThread(thread.id);
+    if (this.#threadIsActive(thread)) {
+      throw new ApiError(409, "THREAD_BUSY", `AI chat thread '${thread.id}' has a running turn`);
+    }
+    if (resolved.workspacePath !== thread.origin.workspacePath) {
+      throw new ApiError(
+        409,
+        "PROJECT_WORKSPACE_CHANGED",
+        "The project's device workspace no longer matches this conversation",
+      );
+    }
+
+    const nodes = input.document.nodes;
+    const unsupportedIndex = nodes.findIndex((node) => !["text", "skill", "agent"].includes(node.type));
+    if (unsupportedIndex >= 0) {
+      throw new ApiError(
+        422,
+        "COMPOSER_NODE_UNSUPPORTED",
+        `Unsupported composer node at index ${unsupportedIndex}`,
+        { nodeIndex: unsupportedIndex },
+      );
+    }
+    const resolvedReferences = nodes.some((node) => node.type === "skill" || node.type === "agent")
+      ? await this.composerCatalog.resolveReferences({
+          workspacePath: resolved.workspacePath,
+          revision: input.revision,
+          nodes,
+        })
+      : nodes.map(() => null);
+    const attachments = input.attachments ?? [];
+    if (
+      nodes.every((node) => node.type !== "text" || node.text.trim() === "")
+      && !nodes.some((node) => node.type === "skill" || node.type === "agent")
+      && attachments.length === 0
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_COMPOSER_DOCUMENT",
+        "A composer message or at least one attachment is required",
+      );
+    }
+
+    const { temporaryDirectory, attachmentPaths } = await this.#writeTurnAttachments(attachments);
+    try {
+      const settings = appServerThreadSettings(thread, resolved);
+      let appServerThreadId = thread.codexThreadId;
+      if (appServerThreadId) {
+        const resumed = await this.appServer.resumeThread({
+          threadId: appServerThreadId,
+          ...settings,
+        });
+        if (resumed?.thread?.id !== appServerThreadId) {
+          throw new Error("Codex returned an unexpected resumed thread id");
+        }
+      } else {
+        const started = await this.appServer.startThread(settings);
+        appServerThreadId = started?.thread?.id;
+        if (typeof appServerThreadId !== "string" || !appServerThreadId) {
+          throw new Error("Codex did not provide a thread id");
+        }
+        this.database.updateAiChatThread(thread.id, { codexThreadId: appServerThreadId });
+      }
+
+      const userInput = nodes.flatMap((node, nodeIndex) => {
+        if (node.type === "text") return { type: "text", text: node.text };
+        const reference = resolvedReferences[nodeIndex];
+        if (node.type === "skill") {
+          return [
+            { type: "text", text: `$${reference.name}` },
+            { type: "skill", name: reference.name, path: reference.path },
+          ];
+        }
+        return { type: "text", text: agentDispatchText(reference) };
+      });
+      for (const [index, attachment] of attachments.entries()) {
+        const attachmentPath = attachmentPaths[index];
+        if (CODEX_IMAGE_TYPES.has(attachment.contentType)) {
+          userInput.push({ type: "localImage", path: attachmentPath });
+        } else {
+          userInput.push({ type: "text", text: `\n\nAttached file: ${attachmentPath}` });
+        }
+      }
+
+      const run = this.database.createAiChatRun({ threadId: thread.id });
+      this.#emit(thread.id, { type: "ai.run", run });
+      const agentDispatches = nodes.flatMap((node, nodeIndex) => {
+        if (node.type !== "agent") return [];
+        const reference = resolvedReferences[nodeIndex];
+        return [{ nodeIndex, id: reference.id, name: reference.name }];
+      });
+      const userEvent = this.database.insertAiChatEvent({
+        threadId: thread.id,
+        runId: run.id,
+        type: "user_message",
+        role: "user",
+        content: nodes.map((node) => (
+          node.type === "text" ? node.text : `@${node.label}`
+        )).join(""),
+        data: {
+          contractVersion: "composer.v1",
+          revision: input.revision,
+          document: input.document,
+          ...(agentDispatches.length > 0
+            ? {
+                dispatchProtocol: AGENT_DISPATCH_PROTOCOL,
+                agentDispatches,
+              }
+            : {}),
+          ...(attachments.length > 0
+            ? {
+                attachments: attachments.map(({ filename, contentType, size }) => ({
+                  filename,
+                  contentType,
+                  size,
+                })),
+              }
+            : {}),
+        },
+      });
+      this.#emit(thread.id, { type: "ai.event", event: userEvent });
+
+      let resolveCompletion;
+      const completion = new Promise((resolve) => { resolveCompletion = resolve; });
+      const active = {
+        kind: "app-server",
+        run,
+        threadId: thread.id,
+        appServerThreadId,
+        turnId: null,
+        interrupted: false,
+        temporaryDirectory,
+        resolveCompletion,
+      };
+      this.active.set(run.id, active);
+      const finalization = completion.finally(() => this.completions.delete(run.id));
+      this.completions.set(run.id, finalization);
+      try {
+        const started = await this.appServer.startTurn({
+          threadId: appServerThreadId,
+          input: userInput,
+          effort: thread.reasoningEffort,
+        });
+        const turnId = started?.turn?.id;
+        if (typeof turnId !== "string" || !turnId) {
+          throw new Error("Codex did not provide a turn id");
+        }
+        active.turnId = turnId;
+      } catch (error) {
+        await this.#finishAppServerRun(active, "failed", error);
+        throw error;
+      }
+      return run;
+    } catch (error) {
+      if (temporaryDirectory && ![...this.active.values()].some(
+        (active) => active.temporaryDirectory === temporaryDirectory,
+      )) {
+        await rm(temporaryDirectory, { recursive: true, force: true });
+      }
+      throw error;
+    }
+  }
+
+  #handleAppServerNotification(notification) {
+    const params = notification?.params;
+    if (!params || typeof params !== "object") return;
+    const active = [...this.active.values()].find((candidate) => (
+      candidate.kind === "app-server"
+      && candidate.appServerThreadId === params.threadId
+      && (!candidate.turnId || !params.turnId || candidate.turnId === params.turnId)
+    ));
+    if (!active) return;
+
+    if (notification.method === "turn/started") {
+      if (typeof params.turn?.id === "string") active.turnId = params.turn.id;
+      return;
+    }
+    if (notification.method === "item/completed") {
+      const normalized = normalizedAppServerItem(params.item);
+      if (!normalized) return;
+      const event = this.database.insertAiChatEvent({
+        threadId: active.threadId,
+        runId: active.run.id,
+        ...normalized,
+      });
+      this.#emit(active.threadId, { type: "ai.event", event });
+      return;
+    }
+    if (notification.method !== "turn/completed") return;
+    const status = params.turn?.status;
+    if (active.interrupted || status === "interrupted") {
+      void this.#finishAppServerRun(active, "interrupted");
+    } else if (status === "completed") {
+      void this.#finishAppServerRun(active, "completed");
+    } else {
+      void this.#finishAppServerRun(
+        active,
+        "failed",
+        params.turn?.error?.message ?? "Codex reported a failed turn",
+      );
+    }
+  }
+
+  async #finishAppServerRun(active, status, error) {
+    if (!this.active.has(active.run.id)) return this.getRun(active.run.id);
+    let publicError = null;
+    if (status === "interrupted") publicError = "Interrupted";
+    if (status === "failed") publicError = cappedError(error) || "Codex turn failed";
+    try {
+      if (status === "failed") {
+        const errorEvent = this.database.insertAiChatEvent({
+          threadId: active.threadId,
+          runId: active.run.id,
+          type: "error",
+          role: "error",
+          content: publicError,
+          data: { status: "failed" },
+        });
+        this.#emit(active.threadId, { type: "ai.event", event: errorEvent });
+      }
+      const run = this.database.updateAiChatRun(active.run.id, {
+        status,
+        exitCode: null,
+        error: publicError,
+        finishedAt: new Date().toISOString(),
+      });
+      this.#emit(active.threadId, { type: "ai.run", run });
+      return run;
+    } finally {
+      this.active.delete(active.run.id);
+      if (active.temporaryDirectory) {
+        await rm(active.temporaryDirectory, { recursive: true, force: true });
+      }
+      active.resolveCompletion();
     }
   }
 

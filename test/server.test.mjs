@@ -1151,7 +1151,7 @@ test("project and task CRUD flow", async () => {
   });
   assert.equal(createResult.response.status, 201);
   const created = createResult.body.task;
-  assert.equal(created.identifier, "WEBSITE-1");
+  assert.equal(created.identifier, "WEB-1");
   assert.equal(created.version, 1);
   assert.equal(created.sortOrder, 1000);
   assert.equal(created.archivedAt, null);

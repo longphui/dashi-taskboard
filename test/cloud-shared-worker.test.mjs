@@ -449,7 +449,7 @@ test("a failed task insert rolls back its reserved project identifier", async ()
 
   const succeeded = await createTask("atomic-counter", "First real issue");
   assert.equal(succeeded.response.status, 201);
-  assert.equal(succeeded.body.task.identifier, "ATOMICCOUNTE-1");
+  assert.equal(succeeded.body.task.identifier, "ATO-1");
 });
 
 test("archived tasks are excluded from project issue counts", async () => {

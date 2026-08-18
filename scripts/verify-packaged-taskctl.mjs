@@ -48,6 +48,7 @@ const runtimeFile = path.join(dataDirectory, "launcher-runtime.json");
 const nodePath = path.join(appPath, "Contents", "MacOS", "node");
 const appRoot = path.join(appPath, "Contents", "Resources", "app");
 const wrapperPath = path.join(appPath, "Contents", "Resources", "bin", "taskctl");
+await stat(path.join(appRoot, "node_modules", "smol-toml", "package.json"));
 const reservation = createServer();
 await new Promise((resolve, reject) => {
   reservation.once("error", reject);

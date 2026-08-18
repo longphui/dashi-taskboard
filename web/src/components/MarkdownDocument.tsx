@@ -5,6 +5,7 @@ import {
   useId,
   useState,
   type ComponentPropsWithoutRef,
+  type ClipboardEventHandler,
   type MouseEvent,
   type ReactElement,
   type ReactNode,
@@ -469,26 +470,34 @@ function MarkdownPre({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
 
 export function MarkdownDocument({
   value,
+  onCopy,
   onLinkClick,
   renderLink,
 }: {
   value: string;
+  onCopy?: ClipboardEventHandler<HTMLDivElement>;
   onLinkClick?: (event: MouseEvent<HTMLAnchorElement>, href?: string) => void;
   renderLink?: (href: string | undefined, children: ReactNode) => ReactNode | null;
 }) {
   return (
-    <div className="issue-description-document">
+    <div className="issue-description-document" onCopy={onCopy}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkStripMarkdownComments, remarkBreaks]}
         urlTransform={(url) => defaultUrlTransform(resolvePersistedAttachmentUrl(url))}
         components={{
-          a: ({ node: _node, href, children, className, ...props }) => {
+          a: ({ node, href, children, className, ...props }) => {
             const renderedLink = renderLink?.(href, children);
             const isRenderedLink = renderedLink !== null && renderedLink !== undefined;
+            const start = node?.position?.start.offset;
+            const end = node?.position?.end.offset;
+            const markdown = typeof start === "number" && typeof end === "number"
+              ? value.slice(start, end)
+              : undefined;
             return (
               <a
                 {...props}
                 className={[className, isRenderedLink ? "issue-reference-link" : ""].filter(Boolean).join(" ") || undefined}
+                data-taskboard-inline-media-markdown={isRenderedLink ? markdown : undefined}
                 href={href}
                 target="_blank"
                 rel="noreferrer"
@@ -497,6 +506,14 @@ export function MarkdownDocument({
                 {isRenderedLink ? renderedLink : children}
               </a>
             );
+          },
+          img: ({ node, ...props }) => {
+            const start = node?.position?.start.offset;
+            const end = node?.position?.end.offset;
+            const markdown = typeof start === "number" && typeof end === "number"
+              ? value.slice(start, end)
+              : undefined;
+            return <img {...props} data-taskboard-inline-media-markdown={markdown} />;
           },
           pre: MarkdownPre,
         }}

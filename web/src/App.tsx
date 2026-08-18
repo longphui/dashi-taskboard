@@ -46,6 +46,7 @@ import {
   listTasks,
   moveTask as moveTaskRequest,
   publishHostRuntime,
+  rebindAiChatComposerReferences,
   removeTaskRelation,
   retryTaskResume,
   resolveTaskboardUrl,
@@ -69,6 +70,8 @@ import { IssueListView } from "./components/IssueListView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
 import { OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
+  createInlineMediaSegments,
+  inlineMediaComposerReferences,
   resolveInlineMediaMarkdown,
   type PendingInlineImage,
 } from "./components/InlineMediaComposer";
@@ -101,6 +104,7 @@ import {
   type OtherTaskTab,
 } from "./issueBoardStatuses";
 import {
+  buildPersistedTaskComposerDocument,
   normalizeCodexThreadId,
   taskCardPresentation,
   type TaskCardPresentation,
@@ -115,6 +119,7 @@ import {
   writeTaskFilters,
 } from "./taskFilters";
 import {
+  COMPOSER_CONTRACT_VERSION,
   TASK_STATUSES,
   type ActorIdentity,
   type AiChatThread,
@@ -2971,7 +2976,7 @@ export function App() {
     }
   }
 
-  function openTaskInThread(task: Task) {
+  async function openTaskInThread(task: Task) {
     const worktreePath = task.developmentContext?.type === "worktree"
       ? task.developmentContext.path
       : null;
@@ -3017,6 +3022,83 @@ export function App() {
       return;
     }
     if (openingThreadTaskId) return;
+    const canonicalReferences = [
+      ...(task.relations.parent
+        ? [{
+            relation: "parent",
+            identifier: task.relations.parent.identifier,
+            title: task.relations.parent.title,
+          }]
+        : []),
+      ...task.relations.subIssues.map((relation) => ({
+        relation: "subIssues",
+        identifier: relation.identifier,
+        title: relation.title,
+      })),
+      ...task.relations.blockedBy.map((relation) => ({
+        relation: "blockedBy",
+        identifier: relation.identifier,
+        title: relation.title,
+      })),
+      ...task.relations.blocks.map((relation) => ({
+        relation: "blocks",
+        identifier: relation.identifier,
+        title: relation.title,
+      })),
+      ...task.relations.related.map((relation) => ({
+        relation: "related",
+        identifier: relation.identifier,
+        title: relation.title,
+      })),
+    ];
+    const beforeDescription = `${instruction}\n\n议题：${task.identifier} ${task.title}\n\n正文：\n`;
+    const afterDescription = `\n\nCanonical references：\n${canonicalReferences.length > 0
+      ? canonicalReferences.map((reference) => (
+          `- ${reference.relation}: ${reference.identifier} ${reference.title}`
+        )).join("\n")
+      : "（无）"}`;
+    const embeddedInstruction = `${beforeDescription}${task.description}${afterDescription}`;
+    if (localAiChatAvailable) {
+      setActionError(null);
+      const descriptionSegments = createInlineMediaSegments(task.description, referenceTasks);
+      if (inlineMediaComposerReferences(descriptionSegments).length === 0) {
+        setAiOpenThreadRequest((current) => ({
+          projectId: task.projectId,
+          issueId: task.id,
+          composerText: embeddedInstruction,
+          requestId: (current?.requestId ?? 0) + 1,
+        }));
+        return;
+      }
+      const persistedDocument = buildPersistedTaskComposerDocument(
+        beforeDescription,
+        descriptionSegments,
+        afterDescription,
+      );
+      setOpeningThreadTaskId(task.id);
+      try {
+        const rebound = await rebindAiChatComposerReferences({
+          contractVersion: COMPOSER_CONTRACT_VERSION,
+          projectId: task.projectId,
+          document: persistedDocument,
+        });
+        setAiOpenThreadRequest((current) => ({
+          projectId: task.projectId,
+          issueId: task.id,
+          composerDraft: {
+            ready: rebound.ready,
+            revision: rebound.revision,
+            document: rebound.ready ? rebound.document : persistedDocument,
+          },
+          requestId: (current?.requestId ?? 0) + 1,
+        }));
+      } catch (error) {
+        setActionError(errorMessage(error));
+      } finally {
+        setOpeningThreadTaskId(null);
+      }
+      return;
+    }
     setOpeningThreadTaskId(task.id);
     setActionError(null);
     if (codexProjectContext?.codexProjectKind === "remote" && codexProjectContext.workspacePath) {
@@ -3032,7 +3114,10 @@ export function App() {
         taskId: task.id,
         identifier: task.identifier,
         title: task.title,
-        instruction,
+        description: task.description,
+        canonicalReferences,
+        instruction: embeddedInstruction,
+        projectName: selectedProject?.name,
         codexProjectId: codexProjectContext?.codexProjectId,
         codexProjectKind: codexProjectContext?.codexProjectKind ?? "local",
         codexHostId: codexProjectContext?.codexHostId ?? "local",
@@ -3631,21 +3716,30 @@ export function App() {
               "让 Codex 检查当前项目目录对应的对话，并整理任务状态。",
               "Ask Codex to inspect conversations for this project directory and organize their task status.",
             )}</p>
-            <button
-              className="button primary"
-              type="button"
-              onClick={() => setAiOpenThreadRequest((current) => ({
-                projectId: selectedProject.id,
-                issueId: null,
-                composerText: text(
-                  "只检查当前项目目录对应的 Codex 对话。请将其中已完成、处理中和待执行的任务整理并导入当前项目的 Taskboard。",
-                  "Only inspect Codex conversations associated with the current project directory. Organize completed, in-progress, and pending tasks, then import them into this project's Taskboard.",
-                ),
-                requestId: (current?.requestId ?? 0) + 1,
-              }))}
-            >
-              {text("导入当前项目任务状态", "Import current project task status")}
-            </button>
+            <div className="page-empty-actions">
+              <button
+                className="button primary"
+                type="button"
+                onClick={() => setAiOpenThreadRequest((current) => ({
+                  projectId: selectedProject.id,
+                  issueId: null,
+                  composerText: text(
+                    "只检查当前项目目录对应的 Codex 对话。请将其中已完成、处理中和待执行的任务整理并导入当前项目的 Taskboard。",
+                    "Only inspect Codex conversations associated with this project directory. Organize completed, in-progress, and pending tasks, then import them into this project's Taskboard.",
+                  ),
+                  requestId: (current?.requestId ?? 0) + 1,
+                }))}
+              >
+                {text("导入当前项目任务状态", "Import current project task status")}
+              </button>
+              <button
+                className="button secondary"
+                type="button"
+                onClick={() => setEditor({ task: null, status: "todo" })}
+              >
+                {text("添加议题", "Add issue")}
+              </button>
+            </div>
           </div>
         ) : boardView === "dashboard" ? (
           <DashboardView
@@ -4018,6 +4112,7 @@ export function App() {
       {editor && (
         <TaskEditor
           key={editor.task?.id ?? `new-${selectedProjectId}-${editor.status}`}
+          projectId={selectedProjectId}
           task={editor.task}
           tasks={tasks.filter((task) => task.projectId === selectedProjectId)}
           referenceTasks={referenceTasks.filter((task) => task.projectId === selectedProjectId)}

@@ -89,6 +89,7 @@ export interface NewTaskEditorDraft {
 }
 
 interface TaskEditorProps {
+  projectId: string;
   task: Task | null;
   tasks: Task[];
   referenceTasks: Task[];
@@ -145,6 +146,7 @@ function contextLabel(
 }
 
 export function TaskEditor({
+  projectId,
   task,
   tasks,
   referenceTasks,
@@ -538,6 +540,7 @@ export function TaskEditor({
               segments={descriptionSegments}
               mentionTasks={tasks}
               referenceTasks={referenceTasks}
+              completionContext={{ projectId, surface: "issue-description" }}
               placeholder={text("添加描述…", "Add description…")}
               ariaLabel={text("描述", "Description")}
               disabled={saving}

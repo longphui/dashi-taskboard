@@ -340,9 +340,15 @@ function validateProjectId(value) {
   return id;
 }
 
-function projectPrefix(projectId) {
-  const prefix = projectId.toUpperCase().replace(/[^A-Z0-9]+/g, "");
-  return (prefix || "TASK").slice(0, 12);
+function projectPrefix(project) {
+  const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
+  const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
+  if (existingPrefix && existingPrefix !== idPrefix) return existingPrefix;
+  if (idPrefix.length <= 5) return idPrefix;
+  const namePrefix = [...project.name.toUpperCase().replace(/[^\p{L}\p{N}]+/gu, "")]
+    .slice(0, 3)
+    .join("");
+  return namePrefix || idPrefix.slice(0, 3);
 }
 
 function now() {
@@ -1521,6 +1527,7 @@ async function createTask(env, input, actor) {
   const project = await env.DB.prepare(`
     SELECT
       projects.id,
+      projects.name,
       (
         SELECT tasks.identifier
         FROM tasks
@@ -1534,9 +1541,7 @@ async function createTask(env, input, actor) {
   if (!project) {
     throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
   }
-  const prefix = project.first_identifier
-    ? project.first_identifier.replace(/-\d+$/, "")
-    : projectPrefix(project.id);
+  const prefix = projectPrefix(project);
   const suffixStart = prefix.length + 2;
   let sortOrder = input.sortOrder;
   if (sortOrder === undefined) {
