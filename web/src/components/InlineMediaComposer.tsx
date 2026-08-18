@@ -1763,9 +1763,15 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
           onInput={() => {
             if (!composing.current) syncSegmentsFromDom();
           }}
-          onCompositionStart={() => { composing.current = true; }}
-          onCompositionEnd={() => {
+          onCompositionStart={(event) => {
+            composing.current = true;
+            event.currentTarget.removeAttribute("data-empty");
+          }}
+          onCompositionEnd={(event) => {
             composing.current = false;
+            if (isEmpty && !event.currentTarget.textContent) {
+              event.currentTarget.dataset.empty = "true";
+            }
             syncSegmentsFromDom();
           }}
           onDragOver={dragContent}
