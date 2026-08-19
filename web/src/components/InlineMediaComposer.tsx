@@ -498,10 +498,21 @@ function inlineMediaClipboardText(segments: InlineMediaSegment[]): string {
   return segments.map((segment) => {
     if (segment.type === "text") return segment.text;
     if (segment.type === "pending-image") return segment.file.name;
-    if (segment.type === "persisted-image") return segment.alt;
-    if (segment.type === "issue-reference") return segment.identifier;
-    return segment.label;
+    return segment.markdown;
   }).join("");
+}
+
+function selfContainedClipboardSegments(
+  segments: InlineMediaSegment[],
+): InlineMediaSegment[] {
+  return segments.map((segment) => {
+    if (
+      segment.type !== "persisted-image"
+      || /^!\[(?:\\.|[^\]])*\]\(/.test(segment.markdown)
+    ) return segment;
+    const alt = segment.alt.replace(/[\\[\]]/g, "\\$&");
+    return { ...segment, markdown: `![${alt}](${segment.url})` };
+  });
 }
 
 function inlineMediaClipboardHtml(
@@ -520,21 +531,11 @@ function inlineMediaClipboardHtml(
       wrapper.append(text);
       continue;
     }
-    if (isInlineReference(segment)) {
-      const link = ownerDocument.createElement("a");
-      const href = /\]\(([^)]+)\)$/.exec(segment.markdown)?.[1];
-      if (href) link.setAttribute("href", href);
-      link.dataset.taskboardInlineMediaMarkdown = segment.markdown;
-      link.textContent = segment.type === "issue-reference" ? segment.identifier : segment.label;
-      wrapper.append(link);
-      continue;
-    }
-    if (segment.type === "persisted-image") {
-      const image = ownerDocument.createElement("img");
-      image.src = resolvePersistedAttachmentUrl(segment.url);
-      image.alt = segment.alt;
-      image.dataset.taskboardInlineMediaMarkdown = segment.markdown;
-      wrapper.append(image);
+    if (isInlineReference(segment) || segment.type === "persisted-image") {
+      const markdown = ownerDocument.createElement("span");
+      markdown.dataset.taskboardInlineMediaMarkdown = segment.markdown;
+      markdown.textContent = segment.markdown;
+      wrapper.append(markdown);
       continue;
     }
     const pendingImage = ownerDocument.createElement("span");
@@ -552,12 +553,13 @@ export function writeInlineMediaClipboard(
   ownerDocument: Document,
 ) {
   const clipboardId = segmentId("clipboard");
-  inlineMediaClipboard = { id: clipboardId, segments };
+  const clipboardSegments = selfContainedClipboardSegments(segments);
+  inlineMediaClipboard = { id: clipboardId, segments: clipboardSegments };
   clipboardData.setData(INLINE_MEDIA_CLIPBOARD_MIME, clipboardId);
-  clipboardData.setData("text/plain", inlineMediaClipboardText(segments));
+  clipboardData.setData("text/plain", inlineMediaClipboardText(clipboardSegments));
   clipboardData.setData(
     "text/html",
-    inlineMediaClipboardHtml(segments, clipboardId, ownerDocument),
+    inlineMediaClipboardHtml(clipboardSegments, clipboardId, ownerDocument),
   );
 }
 
@@ -784,13 +786,14 @@ function IssueReferenceChip({
   const displayIdentifier = task?.externalKey ?? segment.identifier;
 
   return (
-    <button
-      type="button"
+    <span
+      role="button"
+      tabIndex={disabled ? -1 : 0}
       className={`issue-reference-inline inline-media-issue-reference${task ? ` issue-reference-status-${task.status}` : ""}`}
       contentEditable={false}
       data-inline-media-segment={segment.id}
       data-taskboard-inline-media-markdown={segment.markdown}
-      disabled={disabled}
+      aria-disabled={disabled}
       aria-label={task
         ? text(
             `${displayIdentifier} ${task.title}，按退格键或删除键移除`,
@@ -801,20 +804,23 @@ function IssueReferenceChip({
             `${displayIdentifier}, press Backspace or Delete to remove`,
           )}
       onKeyDown={(event) => {
+        if (disabled) return;
         if (event.defaultPrevented) return;
         if (event.key !== "Backspace" && event.key !== "Delete") return;
         event.preventDefault();
         onRemove();
       }}
     >
-      {task && (
-        <span className={`status-icon issue-reference-status status-icon-${STATUS_DETAILS[task.status].tone}`}>
-          <ColumnStatusIcon status={task.status === "backlog" ? "todo" : task.status} />
-        </span>
-      )}
-      <span className="issue-reference-id">{displayIdentifier}</span>
+      <span className="issue-reference-identity">
+        {task && (
+          <span className={`status-icon issue-reference-status status-icon-${STATUS_DETAILS[task.status].tone}`}>
+            <ColumnStatusIcon status={task.status === "backlog" ? "todo" : task.status} />
+          </span>
+        )}
+        <span className="issue-reference-id">{displayIdentifier}</span>
+      </span>
       {task && <span className="issue-reference-title">{task.title}</span>}
-    </button>
+    </span>
   );
 }
 

@@ -2720,11 +2720,9 @@ kbd {
 }
 
 .issue-description-document a.issue-reference-link {
-  display: inline-flex;
-  min-width: 0;
-  max-width: 100%;
+  display: inline;
   color: inherit;
-  vertical-align: middle;
+  vertical-align: baseline;
 }
 
 .issue-description-document a.issue-reference-link:hover {
@@ -2732,16 +2730,13 @@ kbd {
 }
 
 .issue-reference-inline {
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
-  max-width: 100%;
-  min-height: 22px;
-  gap: 5px;
-  padding: 0 6px 0 4px;
+  display: inline;
+  padding: 0 2px;
   border-radius: 5px;
   background: var(--column-status-background, var(--surface-hover));
   box-shadow: inset 0 0 0 var(--border-hairline) var(--border);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
   color: var(--text-secondary);
   font-size: 0.94em;
   line-height: 22px;
@@ -2753,11 +2748,12 @@ kbd {
 }
 
 .issue-reference-status {
-  display: grid;
+  display: inline-grid;
   place-items: center;
-  flex: 0 0 15px;
   width: 15px;
   height: 15px;
+  margin-right: 5px;
+  vertical-align: -2px;
 }
 
 .issue-reference-status .taskboard-icon {
@@ -2767,16 +2763,18 @@ kbd {
   border-radius: 0;
 }
 
+.issue-reference-identity {
+  white-space: nowrap;
+}
+
 .issue-reference-id {
-  flex: 0 0 auto;
+  margin-right: 5px;
   color: var(--column-status-color, var(--text-secondary));
   font-weight: 550;
   font-variant-numeric: tabular-nums;
 }
 
 .issue-reference-title {
-  flex: 1 1 auto;
-  min-width: 0;
   color: var(--text-primary);
   overflow-wrap: anywhere;
   white-space: normal;
@@ -3296,9 +3294,14 @@ kbd {
 }
 
 .issue-relation-results > button:hover,
-.issue-relation-results > button.is-active {
+.issue-relation-results > button.is-active,
+.issue-relation-results > button.is-selected {
   background: var(--surface-hover);
   color: var(--text-primary);
+}
+
+.issue-relation-results.has-selections > button {
+  grid-template-columns: 16px max-content minmax(0, 1fr) 16px;
 }
 
 .issue-relation-results > button > svg {
@@ -3323,6 +3326,19 @@ kbd {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.issue-relation-option-check {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-tertiary);
+}
+
+.issue-relation-option-check svg {
+  width: 12px;
+  height: 12px;
 }
 
 .issue-relation-empty {
@@ -7125,58 +7141,8 @@ kbd {
 }
 
 .task-create-relation-submenu {
-  position: absolute;
-  z-index: 1;
   top: 0;
   left: calc(100% + 4px);
-  width: min(360px, calc(100vw - 16px));
-  max-height: min(360px, calc(100vh - 16px));
-  padding: 6px;
-  overflow-y: auto;
-  border: var(--border-hairline) solid var(--border-strong);
-  border-radius: 12px;
-  background: var(--surface-raised);
-  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.14), 0 4px 12px rgba(0, 0, 0, 0.08);
-}
-
-.task-create-relation-submenu > button {
-  display: grid;
-  grid-template-columns: 16px max-content minmax(0, 1fr) 16px;
-  align-items: center;
-  width: 100%;
-  min-height: 36px;
-  gap: 8px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.task-create-relation-submenu > button:hover,
-.task-create-relation-submenu > button.is-selected {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-
-.task-create-relation-submenu > button > svg,
-.task-create-relation-submenu > button > .taskboard-icon {
-  width: 14px;
-  height: 14px;
-}
-
-.task-create-relation-check {
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  color: var(--text-tertiary);
-}
-
-.task-create-relation-check svg {
-  width: 12px;
-  height: 12px;
 }
 
 .due-popover {
@@ -8034,15 +8000,16 @@ kbd {
 }
 
 .ai-chat-thinking-detail {
-  margin-top: 4px;
   margin-left: -12px;
   color: var(--text-tertiary);
   font-size: 13px;
 }
 
 .ai-chat-thinking-detail-trigger {
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  width: 100%;
+  min-width: 0;
   min-height: 26px;
   gap: 6px;
   padding: 4px 12px;
@@ -8056,22 +8023,36 @@ kbd {
   transition: background-color 80ms ease, color 80ms ease;
 }
 
+.ai-chat-thinking-detail-trigger .ai-chat-thinking-step-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.ai-chat-thinking-detail-trigger .ai-chat-thinking-step-description {
+  flex: 1 1 auto;
+}
+
 .ai-chat-thinking-detail-trigger:hover {
-  background: var(--surface-muted);
   color: var(--text-secondary);
 }
 
 .ai-chat-thinking-detail-trigger:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
-  outline-offset: 2px;
-  border-radius: 4px;
+  outline: 0;
 }
 
 .ai-chat-thinking-detail-trigger svg {
   order: 2;
+  flex: 0 0 auto;
   width: 12px;
   height: 12px;
-  transition: transform 140ms ease;
+  opacity: 0;
+  transition: opacity 80ms ease, transform 140ms ease;
+}
+
+.ai-chat-thinking-detail-trigger:hover svg,
+.ai-chat-thinking-detail-trigger:focus-visible svg,
+.ai-chat-thinking-detail.is-open .ai-chat-thinking-detail-trigger svg {
+  opacity: 1;
 }
 
 .ai-chat-thinking-detail.is-open .ai-chat-thinking-detail-trigger svg {

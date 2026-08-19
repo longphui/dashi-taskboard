@@ -32,6 +32,7 @@ Use this workflow when the user asks to process Taskboard work.
 - Research, triage, replies, and other work that does not change code normally do not need a worktree.
 - For code changes, start from verified current `origin/main`, create a feature branch, and use a worktree. Never implement directly on `main`.
 - Keep task conversations visible and traceable. Do not pin newly created task conversations. Do not pass this no-pin rule, or restrictions on subagents, into the delegated task prompt unless the user requests it for that task.
+- For every newly dispatched task conversation, explicitly use the same model and reasoning level as the coordinating conversation. Do not substitute a skill default, cheaper model, or lower reasoning level. Existing conversations do not need to be recreated when this rule is added later.
 - Bind each claimed issue to the actual conversation, branch, and worktree used for it, and record the grouping decision in the issue.
 
 ## 3. Follow E3
@@ -59,24 +60,27 @@ Make the smallest root-cause change. Do not add unrelated refactors, abstraction
 
 - Keep the issue `in_progress` during implementation.
 - Verify the direct user path. For changes on a UI surface, use the real browser/App surface. Capture visual evidence when the result has visual impact; this evidence supports review and does not by itself require a separate user UI confirmation.
-- Report changed files, commit, exact head SHA, direct verification, PR, CI state, and remaining limitations in the issue.
+- Report changed files, commit, exact head SHA, direct verification, PR, CI state, review complexity decision, review result, and remaining limitations in the issue.
 - Show ongoing status in the Taskboard opened through the injected Codex App.
 - Execution conversations do not merge, release, mark `done`, or claim user acceptance.
 
 ## 6. Review by risk
 
-- The coordinating conversation reviews the diff, real path, evidence, scope, and CI before accepting an execution result.
-- Use ChatGPT web Pro review for complex or risky implementation. Ask it to review only implementation correctness and real bugs, without over-defensive or over-designed recommendations.
-- Wait for the complete Pro answer. Do not use an instant-answer result. Check at approximately five-minute intervals when necessary; a complete review can take more than 30 minutes.
-- Simple mechanical changes, documentation, README updates, version-only changes, and already-approved code followed only by trivial edits can skip Pro review.
-- Fix actionable blockers in the same PR. Repeat Pro review only when the new implementation complexity warrants it.
+- Each dispatched execution conversation decides the review complexity for its own implementation after direct-path verification. The coordinating conversation does not make this complexity decision or perform the code review.
+- For lower-complexity work, the dispatched execution Agent performs the code review. It checks implementation correctness, the requested path, scope, and real bugs without sending the PR to ChatGPT web Pro.
+- For complex or risky work, the corresponding dispatched execution conversation opens ChatGPT web Pro itself and submits the PR URL and exact head SHA for review. It asks Pro to review only implementation correctness and real bugs.
+- Development and review must avoid over-design and over-defensive recommendations. Do not request or add hypothetical guardrails, unrelated refactors, compatibility layers, style preferences, or scope expansion.
+- Independent dispatched conversations run their required reviews in parallel. Do not serialize independent Agent or Pro reviews through the coordinating conversation.
+- For Pro review, wait for the complete answer. Do not use an instant-answer result. Check at approximately five-minute intervals when necessary; a complete review can take more than 30 minutes.
+- Fix actionable blockers in the same PR. The dispatched execution conversation decides whether the changed complexity warrants another Pro review; trivial targeted follow-up edits can use its normal Agent review.
+- Before accepting a handoff, the coordinating conversation checks that the execution evidence, scope, CI state, complexity decision, and required review result are present. It does not repeat the code review.
 - Decide the UI confirmation gate from the actual visual impact and risk. Do not trigger it mechanically because code is in a UI component or changes a UI file.
 - Logic-only changes on a UI surface do not need separate user UI confirmation when they do not cause a meaningful visual change. This includes interaction logic, data behavior, toggle behavior, popover close conditions, and copy-and-paste behavior.
 - Small, low-risk, and visually unambiguous changes can skip user UI confirmation after the coordinator checks the real path and visual evidence. Examples include a local font-size, spacing, alignment, or color adjustment.
 - Require user UI confirmation before merge when the change adds UI, meaningfully changes layout, information hierarchy, or the presentation of a core interaction, has multiple reasonable visual choices, or the user explicitly asks to confirm the style.
 - User UI confirmation is a final acceptance gate, not an intermediate development checkpoint. For work that requires it, ask only after the full function is complete, direct verification passes, and any complexity-based Pro review passes. Never ask the user to confirm a partially implemented UI.
 - After Pro approval, visual-only adjustments made from the user's final UI feedback do not require another Pro review. The coordinator checks that the delta is limited to the requested visual change, reruns the real path, and can then proceed to merge. If the adjustment changes functional logic or introduces new complex risk, reassess whether code review or Pro review is required.
-- Close temporary review browser tabs after review finishes.
+- The dispatched execution conversation closes its temporary review browser tabs after review finishes.
 
 ## 7. Acceptance and issue status
 

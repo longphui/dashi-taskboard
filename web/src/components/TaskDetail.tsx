@@ -395,16 +395,20 @@ function DescriptionDocument({
         if (!task) {
           return (
             <span className="issue-reference-inline">
-              <span className="issue-reference-id">{reference.identifier}</span>
+              <span className="issue-reference-identity">
+                <span className="issue-reference-id">{reference.identifier}</span>
+              </span>
             </span>
           );
         }
         return (
           <span className={`issue-reference-inline issue-reference-status-${task.status}`}>
-            <span className={`status-icon issue-reference-status status-icon-${STATUS_DETAILS[task.status].tone}`}>
-              <ColumnStatusIcon status={task.status === "backlog" ? "todo" : task.status} />
+            <span className="issue-reference-identity">
+              <span className={`status-icon issue-reference-status status-icon-${STATUS_DETAILS[task.status].tone}`}>
+                <ColumnStatusIcon status={task.status === "backlog" ? "todo" : task.status} />
+              </span>
+              <span className="issue-reference-id">{task.externalKey ?? task.identifier}</span>
             </span>
-            <span className="issue-reference-id">{task.externalKey ?? task.identifier}</span>
             <span className="issue-reference-title">{task.title}</span>
           </span>
         );
