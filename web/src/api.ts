@@ -524,16 +524,17 @@ export async function listDevelopmentContexts(
 }
 
 async function listTasksByArchive(
-  projectId: string,
+  projectId: string | undefined,
   archived: "true" | "false",
   signal?: AbortSignal,
 ): Promise<Task[]> {
-  const params = new URLSearchParams({ projectId, archived });
+  const params = new URLSearchParams({ archived });
+  if (projectId) params.set("projectId", projectId);
   const data = await request<{ tasks: Task[] }>(`/api/tasks?${params}`, { signal });
   return data.tasks;
 }
 
-export function listTasks(projectId: string, signal?: AbortSignal): Promise<Task[]> {
+export function listTasks(projectId?: string, signal?: AbortSignal): Promise<Task[]> {
   return listTasksByArchive(projectId, "false", signal);
 }
 
@@ -545,7 +546,7 @@ export async function getTask(taskId: string, signal?: AbortSignal): Promise<Tas
   return data.task;
 }
 
-export function listArchivedTasks(projectId: string, signal?: AbortSignal): Promise<Task[]> {
+export function listArchivedTasks(projectId?: string, signal?: AbortSignal): Promise<Task[]> {
   return listTasksByArchive(projectId, "true", signal);
 }
 

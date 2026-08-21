@@ -2892,7 +2892,7 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
           const filters = parseTaskFilters(url.searchParams);
-          if (filters.projectId === JIRA_PROJECT_ID) await jira.sync();
+          if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) await jira.sync();
           return sendJson(response, 200, { tasks: database.listTasks(filters) });
         }
         if (request.method === "POST") {

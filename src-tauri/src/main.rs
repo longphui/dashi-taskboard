@@ -82,6 +82,11 @@ struct LauncherPidRecord {
     injector_path: PathBuf,
 }
 
+#[derive(Deserialize)]
+struct LauncherRuntimeDescriptor {
+    url: String,
+}
+
 struct LauncherState {
     child: Mutex<Option<u32>>,
     snapshot: Mutex<LauncherSnapshot>,
@@ -811,6 +816,15 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
                 {
                     snapshot.open_request_pending = false;
                 }
+            } else if !is_stderr && line.contains("\"openedTaskboardInExistingCodex\":true") {
+                update_snapshot(&app, &state, |snapshot| {
+                    if state.generation.load(Ordering::SeqCst) == generation
+                        && snapshot.child_pid == Some(pid)
+                    {
+                        snapshot.phase = "running".into();
+                        snapshot.message = "任务面板已在现有 Codex 的浏览面板中打开。".into();
+                    }
+                });
             } else if !is_stderr && line.contains("\"injected\"") {
                 update_snapshot(&app, &state, |snapshot| {
                     if state.generation.load(Ordering::SeqCst) == generation
@@ -1126,6 +1140,28 @@ fn restart_launcher(
 fn open_taskboard(state: &LauncherState) -> Result<(), String> {
     state.snapshot.lock().unwrap().open_request_pending = true;
     signal_pending_taskboard_open(state)
+}
+
+fn open_taskboard_in_browser(state: &LauncherState) -> Result<(), String> {
+    let descriptor = fs::read_to_string(state.data_directory.join("launcher-runtime.json"))
+        .map_err(|error| error.to_string())?;
+    let descriptor: LauncherRuntimeDescriptor =
+        serde_json::from_str(&descriptor).map_err(|error| error.to_string())?;
+    let url = format!("{}/", descriptor.url.trim_end_matches('/'));
+    #[cfg(target_os = "macos")]
+    let status = StdCommand::new("/usr/bin/open")
+        .arg(&url)
+        .status()
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "windows")]
+    let status = StdCommand::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", &url])
+        .status()
+        .map_err(|error| error.to_string())?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "系统默认浏览器没有打开任务面板".to_string())
 }
 
 async fn check_for_startup_update(
@@ -1582,6 +1618,13 @@ fn main() {
             *state.status_menu.lock().unwrap() = Some(launcher_status.clone());
             let open_taskboard_item =
                 MenuItem::with_id(app, "open-taskboard", "打开任务面板", true, None::<&str>)?;
+            let open_taskboard_web = MenuItem::with_id(
+                app,
+                "open-taskboard-web",
+                "在网页打开任务面板",
+                true,
+                None::<&str>,
+            )?;
             let check_update =
                 MenuItem::with_id(app, "check-update", "检查更新", false, None::<&str>)?;
             let restart_codex =
@@ -1602,6 +1645,7 @@ fn main() {
                     &app_info,
                     &launcher_status,
                     &open_taskboard_item,
+                    &open_taskboard_web,
                     &restart_codex,
                     &check_update,
                     &autostart,
@@ -1644,6 +1688,22 @@ fn main() {
                                     "Codex Taskboard 打开失败",
                                     &format!("{error}\n\n请确认 Codex 正在运行。"),
                                 );
+                            }
+                        });
+                    }
+                    "open-taskboard-web" => {
+                        let Some(state) = app.try_state::<Arc<LauncherState>>() else {
+                            return;
+                        };
+                        let state = Arc::clone(state.inner());
+                        let app = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if let Err(error) = open_taskboard_in_browser(&state) {
+                                append_log(
+                                    &state,
+                                    &format!("Launcher menu browser open failed: {error}"),
+                                );
+                                show_error_dialog(&app, "Codex Taskboard 网页打开失败", &error);
                             }
                         });
                     }

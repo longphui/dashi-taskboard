@@ -94,10 +94,11 @@ interface OtherTasksPanelProps {
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
+  projectNames?: Record<string, string>;
   currentUser: ActorIdentity;
   showCover: boolean;
   showBody: boolean;
-  onCreateLabel: (label: string) => Promise<void>;
+  onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   restoringTaskId: string | null;
   deletingTaskId: string | null;
   onTabChange: (tab: OtherTaskTab) => void;
@@ -129,6 +130,7 @@ export function OtherTasksPanel({
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
+  projectNames,
   currentUser,
   showCover,
   showBody,
@@ -290,10 +292,11 @@ export function OtherTasksPanel({
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}
+              projectName={projectNames?.[task.projectId]}
               currentUser={currentUser}
               showCover={showCover}
               showBody={showBody}
-              onCreateLabel={onCreateLabel}
+              onCreateLabel={(label) => onCreateLabel(label, task.projectId)}
               onEdit={onEdit}
               onUpdate={onUpdate}
               onContextMenu={onContextMenu}

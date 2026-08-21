@@ -19,7 +19,7 @@ import type {
   TaskConversationItem,
 } from "../taskConversations";
 import { ActorAvatar } from "./ActorAvatar";
-import { LinearPriorityIcon } from "./LinearIcon";
+import { LinearIcon, LinearPriorityIcon } from "./LinearIcon";
 import { LabelPicker } from "./LabelPicker";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
@@ -38,6 +38,7 @@ interface TaskCardProps {
   isSettling: boolean;
   isContextMenuOpen: boolean;
   availableLabels: string[];
+  projectName?: string;
   currentUser: ActorIdentity;
   showCover: boolean;
   showBody: boolean;
@@ -414,6 +415,7 @@ export function TaskCard({
   isSettling,
   isContextMenuOpen,
   availableLabels,
+  projectName,
   currentUser,
   showCover,
   showBody,
@@ -451,8 +453,8 @@ export function TaskCard({
     [showBody, task.description],
   );
   const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
-  const showsProperties = !processingCard
-    && (hasProperties || showsInlineParticipants || showsConversation);
+  const showsProperties = Boolean(projectName)
+    || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
 
   function updateProperty(changes: Partial<TaskDraft>, property: NonNullable<typeof savingProperty>) {
@@ -540,7 +542,13 @@ export function TaskCard({
 
       {showsProperties && (
         <div className="card-properties" aria-label={text("议题属性", "Issue properties")}>
-          {task.priority !== "none" && (
+          {projectName && (
+            <span className="project-chip" title={projectName}>
+              <LinearIcon name="project" />
+              <span>{projectName}</span>
+            </span>
+          )}
+          {!processingCard && task.priority !== "none" && (
             <PriorityControl
               task={task}
               disabled={propertyDisabled}
@@ -549,7 +557,7 @@ export function TaskCard({
               onChange={(priority) => updateProperty({ priority }, "priority")}
             />
           )}
-          {task.labels.length > 0 && (
+          {!processingCard && task.labels.length > 0 && (
             <LabelPicker
               availableLabels={availableLabels}
               selectedLabels={task.labels}
@@ -563,15 +571,17 @@ export function TaskCard({
               onCreateLabel={onCreateLabel}
             />
           )}
-          <DueDateControl
-            task={task}
-            disabled={propertyDisabled}
-            onChange={(dueDate) => updateProperty({
-              dueDate,
-              ...(dueDate ? {} : { recurrence: null }),
-            }, "dueDate")}
-          />
-          {showsInlineParticipants && (
+          {!processingCard && (
+            <DueDateControl
+              task={task}
+              disabled={propertyDisabled}
+              onChange={(dueDate) => updateProperty({
+                dueDate,
+                ...(dueDate ? {} : { recurrence: null }),
+              }, "dueDate")}
+            />
+          )}
+          {!processingCard && showsInlineParticipants && (
             <AssigneeControl
               task={task}
               participants={task.participants}
@@ -582,8 +592,8 @@ export function TaskCard({
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
           )}
-          {showsConversation && <span className="card-properties-spacer" aria-hidden="true" />}
-          {showsConversation && (
+          {!processingCard && showsConversation && <span className="card-properties-spacer" aria-hidden="true" />}
+          {!processingCard && showsConversation && (
             <TaskConversationMenu
               conversations={presentation.conversations}
               onOpenConversation={onOpenConversation}

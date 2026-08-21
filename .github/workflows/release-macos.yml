@@ -14,8 +14,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-windows-preview:
+    name: Build unsigned Windows x64 Preview
+    runs-on: windows-2025
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust 1.88
+        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build unsigned Windows x64 Preview
+        run: npm run app:build:windows
+
+      - name: Preserve unsigned Windows x64 Preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-preview-${{ github.sha }}
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
   release-macos:
     name: Build signed universal macOS app
+    needs: release-windows-preview
     runs-on: macos-latest
     timeout-minutes: 90
 
@@ -254,6 +290,12 @@ jobs:
           RELEASE_ROOT="$BUNDLE_ROOT/release"
           npm run app:verify-release -- "$APP_PATH" "$DMG_PATH" "$RELEASE_ROOT" "$RELEASE_TAG"
 
+      - name: Restore unsigned Windows x64 Preview
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-preview-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-preview
+
       - name: Create trusted release asset manifest
         run: |
           set -euo pipefail
@@ -267,13 +309,17 @@ jobs:
           cp "$BUNDLE_ROOT/release/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz" "$RELEASE_ASSETS/"
           cp "$BUNDLE_ROOT/release/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz.sig" "$RELEASE_ASSETS/"
           cp "$BUNDLE_ROOT/release/latest.json" "$RELEASE_ASSETS/"
+          cp \
+            "$RUNNER_TEMP/windows-preview/Codex Taskboard_${PACKAGE_VERSION}_x64-setup.exe" \
+            "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_Windows-x64-unsigned-preview-setup.exe"
           (
             cd "$RELEASE_ASSETS"
             shasum -a 256 \
               "Codex.Taskboard_${PACKAGE_VERSION}_macOS-universal.dmg" \
               "Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz" \
               "Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz.sig" \
-              "latest.json" > "$MANIFEST_ROOT/release-assets.sha256"
+              "latest.json" \
+              "Codex.Taskboard_${PACKAGE_VERSION}_Windows-x64-unsigned-preview-setup.exe" > "$MANIFEST_ROOT/release-assets.sha256"
           )
 
       - name: Preserve trusted release asset manifest
@@ -299,7 +345,8 @@ jobs:
             "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_macOS-universal.dmg" \
             "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz" \
             "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz.sig" \
-            "$RELEASE_ASSETS/latest.json"
+            "$RELEASE_ASSETS/latest.json" \
+            "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_Windows-x64-unsigned-preview-setup.exe"
 
       - name: Remove temporary signing files
         if: always()

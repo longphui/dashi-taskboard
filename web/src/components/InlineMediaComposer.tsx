@@ -50,6 +50,7 @@ interface InlineImageSegment {
   type: "pending-image";
   token: string;
   file: File;
+  dataUrl: string | null;
 }
 
 interface PersistedImageSegment {
@@ -65,6 +66,8 @@ interface IssueReferenceSegment {
   type: "issue-reference";
   markdown: string;
   identifier: string;
+  projectId: string;
+  issueIdentifier: string;
   taskId: string | null;
 }
 
@@ -183,34 +186,99 @@ function textSegment(text = ""): InlineTextSegment {
   return { id: segmentId("text"), type: "text", text };
 }
 
-function imageSegment(file: File): InlineImageSegment {
+function imageSegment(file: File, dataUrl: string | null = null): InlineImageSegment {
   const id = segmentId("image");
-  return {
+  const segment: InlineImageSegment = {
     id,
     type: "pending-image",
     token: `<!--taskboard-inline-image:${id}-->`,
     file,
+    dataUrl,
   };
+  if (!dataUrl) {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      if (typeof reader.result === "string") segment.dataUrl = reader.result;
+    });
+    reader.readAsDataURL(file);
+  }
+  return segment;
 }
 
 const COMPOSER_REFERENCE_URL = /^taskboard:\/\/composer-reference\/v1\/(skill|agent)\/([A-Za-z0-9_-]+)$/;
 const COMPOSER_REFERENCE_NAMESPACE_URL = /^taskboard:\/\/composer-reference\/([^/]+)\/([^/]+)\/([A-Za-z0-9_-]+)$/;
+const ISSUE_COMPOSER_REFERENCE_URL = /^taskboard:\/\/composer-reference\/v1\/issue\/([A-Za-z0-9_-]+)$/;
+const IMAGE_COMPOSER_REFERENCE_URL = /^taskboard:\/\/composer-reference\/v1\/image\/([A-Za-z0-9_-]+)$/;
+const PENDING_IMAGE_COMPOSER_REFERENCE_URL = /^taskboard:\/\/composer-reference\/v1\/pending-image\/([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/;
 
-function base64UrlReferenceKey(
-  value: string,
-  requireNfc: boolean,
-): string | null {
+function encodedComposerReferenceKey(value: string): string {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(value)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodedComposerReferenceKey(value: string): string | null {
   if (!value || value.length % 4 === 1) return null;
   try {
     const padded = `${value.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - value.length % 4) % 4)}`;
     const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
     const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    if (!decoded || (requireNfc && decoded !== decoded.normalize("NFC"))) return null;
-    const canonical = btoa(String.fromCharCode(...new TextEncoder().encode(decoded)))
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-    return canonical === value ? value : null;
+    return decoded && encodedComposerReferenceKey(decoded) === value ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function base64UrlReferenceKey(
+  value: string,
+  requireNfc: boolean,
+): string | null {
+  const decoded = decodedComposerReferenceKey(value);
+  return decoded && (!requireNfc || decoded === decoded.normalize("NFC")) ? value : null;
+}
+
+function issueComposerReference(url: string) {
+  const match = ISSUE_COMPOSER_REFERENCE_URL.exec(url);
+  const value = match ? decodedComposerReferenceKey(match[1]) : null;
+  if (!value) return null;
+  const route = new URLSearchParams(value);
+  const projectId = route.get("project")?.trim();
+  const identifier = readIssueIdentifier(value);
+  return projectId && identifier ? { projectId, identifier } : null;
+}
+
+function attachmentIdFromUrl(url: string): string | null {
+  try {
+    const path = new URL(url, "http://taskboard.local").pathname;
+    return path.match(/\/api\/attachments\/([A-Za-z0-9_-]+)\/content$/)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function imageComposerReference(url: string): string | null {
+  const match = IMAGE_COMPOSER_REFERENCE_URL.exec(url);
+  const attachmentId = match ? decodedComposerReferenceKey(match[1]) : null;
+  return attachmentId && /^[A-Za-z0-9_-]+$/.test(attachmentId) ? attachmentId : null;
+}
+
+function pendingImageComposerReference(
+  url: string,
+  name: string,
+): { file: File; dataUrl: string } | null {
+  const match = PENDING_IMAGE_COMPOSER_REFERENCE_URL.exec(url);
+  const type = match ? decodedComposerReferenceKey(match[1]) : null;
+  if (!match || !type?.startsWith("image/")) return null;
+  try {
+    const base64 = `${match[2].replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - match[2].length % 4) % 4)}`;
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return {
+      file: new File([bytes], name || "image", { type }),
+      dataUrl: `data:${type};base64,${base64}`,
+    };
   } catch {
     return null;
   }
@@ -274,13 +342,30 @@ export function createInlineMediaSegments(
 ): InlineMediaSegment[] {
   const segments: InlineMediaSegment[] = [];
   const items: Array<
-    | { type: "persisted-image"; start: number; end: number; alt: string; url: string }
+    | {
+        type: "persisted-image";
+        start: number;
+        end: number;
+        alt: string;
+        url: string;
+        markdown?: string;
+      }
     | {
         type: "issue-reference";
         start: number;
         end: number;
         identifier: string;
+        projectId: string;
+        issueIdentifier: string;
         taskId: string | null;
+        markdown?: string;
+      }
+    | {
+        type: "pending-image";
+        start: number;
+        end: number;
+        file: File;
+        dataUrl: string;
       }
     | (Omit<InlineComposerReferenceSegment, "id"> & { start: number; end: number })
     | (Omit<InlineUnsupportedComposerReferenceSegment, "id"> & { start: number; end: number })
@@ -292,13 +377,29 @@ export function createInlineMediaSegments(
   while (nodes.length > 0) {
     const node = nodes.pop()!;
     if (node.type === "image") {
-      items.push({
-        type: "persisted-image",
-        start: node.position.start.offset,
-        end: node.position.end.offset,
-        alt: node.alt ?? "",
-        url: node.url!,
-      });
+      const alt = node.alt ?? "";
+      const pendingImage = pendingImageComposerReference(node.url!, alt);
+      if (pendingImage) {
+        items.push({
+          type: "pending-image",
+          start: node.position.start.offset,
+          end: node.position.end.offset,
+          ...pendingImage,
+        });
+      } else {
+        const attachmentId = imageComposerReference(node.url!);
+        const url = attachmentId ? `api/attachments/${attachmentId}/content` : node.url!;
+        items.push({
+          type: "persisted-image",
+          start: node.position.start.offset,
+          end: node.position.end.offset,
+          alt,
+          url,
+          markdown: attachmentId
+            ? `![${alt.replace(/[\\[\]]/g, "\\$&")}](${url})`
+            : undefined,
+        });
+      }
     }
     if (node.type === "imageReference") {
       const definition = getDefinition(node.identifier);
@@ -312,9 +413,13 @@ export function createInlineMediaSegments(
         });
       }
     }
-    if (node.type === "link" && node.url?.startsWith("?")) {
-      const projectId = new URLSearchParams(node.url).get("project");
-      const identifier = readIssueIdentifier(node.url);
+    let handledIssueReference = false;
+    if (node.type === "link" && node.url) {
+      const stableIssue = issueComposerReference(node.url);
+      const projectId = stableIssue?.projectId
+        ?? (node.url.startsWith("?") ? new URLSearchParams(node.url).get("project") : null);
+      const identifier = stableIssue?.identifier
+        ?? (node.url.startsWith("?") ? readIssueIdentifier(node.url) : null);
       const task = projectId && identifier
         ? referenceTasks.find((candidate) => (
             candidate.projectId === projectId && candidate.identifier === identifier
@@ -326,11 +431,17 @@ export function createInlineMediaSegments(
           start: node.position.start.offset,
           end: node.position.end.offset,
           identifier: task?.externalKey ?? identifier,
+          projectId,
+          issueIdentifier: identifier,
           taskId: task?.id ?? null,
+          markdown: stableIssue
+            ? `[@${task?.externalKey ?? identifier}](?${new URLSearchParams({ project: projectId, issue: identifier })})`
+            : undefined,
         });
+        handledIssueReference = true;
       }
     }
-    const composerReference = composerReferenceFromNode(node, text);
+    const composerReference = handledIssueReference ? null : composerReferenceFromNode(node, text);
     if (composerReference) items.push(composerReference);
     if (node.children) nodes.push(...node.children);
   }
@@ -340,11 +451,13 @@ export function createInlineMediaSegments(
 
   for (const item of items) {
     if (item.start > offset) segments.push(textSegment(text.slice(offset, item.start)));
-    if (item.type === "persisted-image") {
+    if (item.type === "pending-image") {
+      segments.push(imageSegment(item.file, item.dataUrl));
+    } else if (item.type === "persisted-image") {
       segments.push({
         id: segmentId("image"),
         type: "persisted-image",
-        markdown: text.slice(item.start, item.end),
+        markdown: item.markdown ?? text.slice(item.start, item.end),
         alt: item.alt,
         url: item.url,
       });
@@ -352,8 +465,10 @@ export function createInlineMediaSegments(
       segments.push({
         id: segmentId("issue"),
         type: "issue-reference",
-        markdown: text.slice(item.start, item.end),
+        markdown: item.markdown ?? text.slice(item.start, item.end),
         identifier: item.identifier,
+        projectId: item.projectId,
+        issueIdentifier: item.issueIdentifier,
         taskId: item.taskId,
       });
     } else if (item.type === "unsupported-reference") {
@@ -497,9 +612,20 @@ function inlineMediaRangeSegments(
 function inlineMediaClipboardText(segments: InlineMediaSegment[]): string {
   return segments.map((segment) => {
     if (segment.type === "text") return segment.text;
-    if (segment.type === "pending-image") return segment.file.name;
+    if (segment.type === "pending-image") {
+      return pendingImageClipboardMarkdown(segment) ?? segment.file.name;
+    }
     return segment.markdown;
   }).join("");
+}
+
+function pendingImageClipboardMarkdown(segment: InlineImageSegment): string | null {
+  const match = segment.dataUrl?.match(/^data:([^;,]+);base64,(.+)$/);
+  if (!match) return null;
+  const typeKey = encodedComposerReferenceKey(match[1]);
+  const dataKey = match[2].replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const alt = segment.file.name.replace(/[\\[\]]/g, "\\$&");
+  return `![${alt}](taskboard://composer-reference/v1/pending-image/${typeKey}.${dataKey})`;
 }
 
 function selfContainedClipboardSegments(
@@ -512,6 +638,35 @@ function selfContainedClipboardSegments(
     ) return segment;
     const alt = segment.alt.replace(/[\\[\]]/g, "\\$&");
     return { ...segment, markdown: `![${alt}](${segment.url})` };
+  });
+}
+
+function stableClipboardSegments(
+  segments: InlineMediaSegment[],
+): InlineMediaSegment[] {
+  return segments.map((segment) => {
+    if (segment.type === "issue-reference") {
+      const route = new URLSearchParams({
+        project: segment.projectId,
+        issue: segment.issueIdentifier,
+      });
+      const referenceKey = encodedComposerReferenceKey(route.toString());
+      return {
+        ...segment,
+        markdown: `[@${segment.identifier}](taskboard://composer-reference/v1/issue/${referenceKey})`,
+      };
+    }
+    if (segment.type === "persisted-image") {
+      const attachmentId = attachmentIdFromUrl(segment.url);
+      if (!attachmentId) return segment;
+      const alt = segment.alt.replace(/[\\[\]]/g, "\\$&");
+      const referenceKey = encodedComposerReferenceKey(attachmentId);
+      return {
+        ...segment,
+        markdown: `![${alt}](taskboard://composer-reference/v1/image/${referenceKey})`,
+      };
+    }
+    return segment;
   });
 }
 
@@ -554,12 +709,13 @@ export function writeInlineMediaClipboard(
 ) {
   const clipboardId = segmentId("clipboard");
   const clipboardSegments = selfContainedClipboardSegments(segments);
+  const exportedSegments = stableClipboardSegments(clipboardSegments);
   inlineMediaClipboard = { id: clipboardId, segments: clipboardSegments };
   clipboardData.setData(INLINE_MEDIA_CLIPBOARD_MIME, clipboardId);
-  clipboardData.setData("text/plain", inlineMediaClipboardText(clipboardSegments));
+  clipboardData.setData("text/plain", inlineMediaClipboardText(exportedSegments));
   clipboardData.setData(
     "text/html",
-    inlineMediaClipboardHtml(clipboardSegments, clipboardId, ownerDocument),
+    inlineMediaClipboardHtml(exportedSegments, clipboardId, ownerDocument),
   );
 }
 
@@ -654,7 +810,7 @@ export function createInlineMediaSegmentsFromHtml(
 function cloneInlineMediaSegments(segments: InlineMediaSegment[]): InlineMediaSegment[] {
   return segments.map((segment) => {
     if (segment.type === "text") return textSegment(segment.text);
-    if (segment.type === "pending-image") return imageSegment(segment.file);
+    if (segment.type === "pending-image") return imageSegment(segment.file, segment.dataUrl);
     const prefix = segment.type === "persisted-image"
       ? "image"
       : segment.type === "issue-reference"
@@ -1131,7 +1287,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
       addImages(files) {
         const images = insertableImages(files);
         if (!images || images.length === 0) return;
-        onChange(normalizeSegments([...segments, ...images.map(imageSegment)]));
+        onChange(normalizeSegments([...segments, ...images.map((file) => imageSegment(file))]));
       },
     }), [onChange, onError, segments]);
 
@@ -1453,6 +1609,8 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
           type: "issue-reference",
           markdown: `[@${displayIdentifier}](?${route})`,
           identifier: displayIdentifier,
+          projectId: task.projectId,
+          issueIdentifier: task.identifier,
           taskId: task.id,
         };
         applyRangeReplacement(
@@ -1623,7 +1781,10 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
       }
       const taskboardHtml = clipboardId
         || clipboardHtml.includes("data-taskboard-inline-media-markdown");
-      if (taskboardHtml) {
+      const pendingImageHtml = clipboardHtml.includes(
+        "data-taskboard-inline-media-pending-image",
+      );
+      if (taskboardHtml && !pendingImageHtml) {
         const htmlSegments = createInlineMediaSegmentsFromHtml(clipboardHtml, referenceTasks);
         if (htmlSegments) {
           event.preventDefault();
@@ -1636,10 +1797,17 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         event.preventDefault();
         const images = insertableImages(clipboardFiles);
         if (!images || images.length === 0) return;
-        applyRangeReplacement(range.start, range.end, images.map(imageSegment), false);
+        applyRangeReplacement(
+          range.start,
+          range.end,
+          images.map((file) => imageSegment(file)),
+          false,
+        );
         return;
       }
-      const htmlSegments = createInlineMediaSegmentsFromHtml(clipboardHtml, referenceTasks);
+      const htmlSegments = pendingImageHtml
+        ? null
+        : createInlineMediaSegmentsFromHtml(clipboardHtml, referenceTasks);
       if (htmlSegments) {
         event.preventDefault();
         applyRangeReplacement(range.start, range.end, htmlSegments, false);
@@ -1669,7 +1837,12 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         ? logicalOffsetForPoint(caretRange.startContainer, caretRange.startOffset, "start")
         : null;
       const insertionOffset = offset ?? currentLogicalRange()?.end ?? segmentsLength(segments);
-      applyRangeReplacement(insertionOffset, insertionOffset, images.map(imageSegment), false);
+      applyRangeReplacement(
+        insertionOffset,
+        insertionOffset,
+        images.map((file) => imageSegment(file)),
+        false,
+      );
     }
 
     function syncSegmentsFromDom() {

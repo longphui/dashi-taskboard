@@ -76,11 +76,12 @@ interface BoardColumnProps {
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
+  projectNames?: Record<string, string>;
   currentUser: ActorIdentity;
   showCover: boolean;
   showBody: boolean;
   createEnabled?: boolean;
-  onCreateLabel: (label: string) => Promise<void>;
+  onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   onCreate: (status: TaskStatus) => void;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
@@ -107,6 +108,7 @@ export function BoardColumn({
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
+  projectNames,
   currentUser,
   showCover,
   showBody,
@@ -227,10 +229,11 @@ export function BoardColumn({
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}
+              projectName={projectNames?.[task.projectId]}
               currentUser={currentUser}
               showCover={showCover}
               showBody={showBody}
-              onCreateLabel={onCreateLabel}
+              onCreateLabel={(label) => onCreateLabel(label, task.projectId)}
               onEdit={onEdit}
               onUpdate={onUpdate}
               onComplete={onComplete}
