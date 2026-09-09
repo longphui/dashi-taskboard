@@ -1,3 +1,17 @@
+import { ApiError } from "../shared/api-fields.mjs";
+import { taskRelationsQuery, taskRelationsFromRows } from "../shared/task-relations.mjs";
+import {
+  commentConversationTitle,
+  threadBindingFromRow,
+  legacyLocalThreadIdFromRow,
+  storedThreadBinding,
+  attachTaskActivity,
+  taskActivityFromRow,
+  taskFieldChanges,
+  taskTreeNode,
+  projectReadmeAttachmentFromRow,
+  projectPrefix,
+} from "../shared/task-records.mjs";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
@@ -6,175 +20,21 @@ import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
-
-export class ApiError extends Error {
-  constructor(status, code, message, details) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-    this.code = code;
-    this.details = details;
-  }
-}
+const TASK_TREE_MAX_NODES = 1_000;
 
 function now() {
   return new Date().toISOString();
 }
 
-function commentConversationTitle(body) {
-  const firstLine = String(body ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  if (!firstLine) return "评论";
-  const compact = firstLine.replace(/\s+/g, " ");
-  return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
-}
-
-function threadBindingFromRow(row) {
+function storedThreadBindingForExisting(current, threadBinding, threadId) {
   if (
-    !row.thread_id
-    || !row.thread_codex_project_id
-    || !row.thread_codex_project_kind
-    || !row.thread_codex_host_id
-    || !row.thread_workspace_path
-  ) return null;
-  return {
-    threadId: row.thread_id,
-    codexProjectId: row.thread_codex_project_id,
-    codexProjectKind: row.thread_codex_project_kind,
-    codexHostId: row.thread_codex_host_id,
-    workspacePath: row.thread_workspace_path,
-  };
-}
-
-function legacyLocalThreadIdFromRow(row) {
-  if (!row.thread_id) return null;
-  return [
-    row.thread_codex_project_id,
-    row.thread_codex_project_kind,
-    row.thread_codex_host_id,
-    row.thread_workspace_path,
-  ].every((value) => value == null)
-    ? row.thread_id
-    : null;
-}
-
-function storedThreadBinding(threadBinding, threadId) {
-  if (threadBinding === undefined && (threadId === undefined || threadId === null)) return undefined;
-  const binding = threadBinding === undefined ? { threadId } : threadBinding;
-  return [
-    binding?.threadId ?? null,
-    binding?.codexProjectId ?? null,
-    binding?.codexProjectKind ?? null,
-    binding?.codexHostId ?? null,
-    binding?.workspacePath ?? null,
-  ];
-}
-
-function attachTaskActivity(task, comments, activities, previewImage = null, resumeRequest = null) {
-  const orderedComments = [...comments].sort((left, right) => (
-    left.id.localeCompare(right.id)
-  ));
-  const orderedActivities = [...activities].sort((left, right) => (
-    left.id.localeCompare(right.id)
-  ));
-  const participants = [];
-  const participantIds = new Set();
-  const addParticipant = (actor) => {
-    const key = `${actor.type}:${actor.id}`;
-    if (participantIds.has(key)) return;
-    participantIds.add(key);
-    participants.push(actor);
-  };
-  addParticipant({
-    type: task.creatorType,
-    id: task.creatorId,
-    name: task.creatorName,
-    avatarUrl: task.creatorAvatarUrl,
-  });
-  addParticipant(task.assignee);
-  for (const comment of orderedComments) {
-    addParticipant({
-      type: comment.author_type,
-      id: comment.author_id,
-      name: comment.author_name,
-      avatarUrl: comment.author_avatar_url,
-    });
+    threadBinding === undefined
+    && current?.threadBinding
+    && current.threadBinding.threadId === threadId
+  ) {
+    return storedThreadBinding(current.threadBinding, threadId);
   }
-  for (const activity of orderedActivities) {
-    addParticipant({
-      type: activity.actor_type,
-      id: activity.actor_id,
-      name: activity.actor_name,
-      avatarUrl: activity.actor_avatar_url,
-    });
-  }
-  const conversationRefs = [];
-  if (task.threadBinding) {
-    conversationRefs.push({
-      ...task.threadBinding,
-      source: "task",
-      sourceId: task.id,
-      title: task.title,
-      updatedAt: task.updatedAt,
-    });
-  } else if (task.legacyLocalThreadId) {
-    conversationRefs.push({
-      threadId: task.legacyLocalThreadId,
-      legacyLocal: true,
-      source: "task",
-      sourceId: task.id,
-      title: task.title,
-      updatedAt: task.updatedAt,
-    });
-  }
-  for (const comment of orderedComments) {
-    const threadBinding = threadBindingFromRow(comment);
-    const legacyLocalThreadId = legacyLocalThreadIdFromRow(comment);
-    if (threadBinding || legacyLocalThreadId) {
-      conversationRefs.push({
-        ...(threadBinding ?? { threadId: legacyLocalThreadId, legacyLocal: true }),
-        source: "comment",
-        sourceId: comment.id,
-        title: commentConversationTitle(comment.body),
-        updatedAt: comment.updated_at,
-      });
-    }
-  }
-
-  task.conversationRefs = conversationRefs;
-  task.participants = participants;
-  task.previewImage = previewImage;
-  task.resumeRequest = resumeRequest;
-  task.activityKey = JSON.stringify({
-    version: 1,
-    task: [task.id, task.version, task.updatedAt],
-    comments: orderedComments.map((comment) => [comment.id, comment.version, comment.updated_at]),
-    changes: orderedActivities.map((activity) => [activity.id, activity.created_at]),
-    resumeRequest: [resumeRequest?.id, resumeRequest?.status, resumeRequest?.updatedAt],
-  });
-  task.activityUpdatedAt = [...orderedComments, ...orderedActivities].reduce(
-    (latest, activity) => {
-      const updatedAt = activity.updated_at ?? activity.created_at;
-      return updatedAt > latest ? updatedAt : latest;
-    },
-    task.updatedAt,
-  );
-  return task;
-}
-
-function taskActivityFromRow(row) {
-  return {
-    id: row.id,
-    taskId: row.task_id,
-    actorType: row.actor_type,
-    actorId: row.actor_id,
-    actorName: row.actor_name,
-    actorAvatarUrl: row.actor_avatar_url,
-    changes: JSON.parse(row.changes),
-    createdAt: row.created_at,
-  };
+  return storedThreadBinding(threadBinding, threadId);
 }
 
 function taskResumeRequestFromRow(row) {
@@ -195,15 +55,6 @@ function taskResumeRequestFromRow(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-function taskFieldChanges(task, changes) {
-  return Object.entries(changes).flatMap(([field, after]) => {
-    const before = task[field];
-    return JSON.stringify(before) === JSON.stringify(after)
-      ? []
-      : [{ field, before, after }];
-  });
 }
 
 function relationActivityValue(type, task) {
@@ -264,7 +115,6 @@ function taskFromRow(row) {
       name: row.assignee_name,
       avatarUrl: row.assignee_avatar_url,
     },
-    workflowId: row.workflow_id,
     developmentContext,
     startDate: row.start_date,
     dueDate: row.due_date,
@@ -302,7 +152,7 @@ function taskRelationSummaryFromRow(row) {
 }
 
 function commentFromRow(row) {
-  return {
+  const comment = {
     id: row.id,
     taskId: row.task_id,
     body: row.body,
@@ -318,10 +168,12 @@ function commentFromRow(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+  Object.defineProperty(comment, "changeRevision", { value: row.change_revision });
+  return comment;
 }
 
 function attachmentFromRow(row) {
-  return {
+  const attachment = {
     id: row.id,
     taskId: row.task_id,
     commentId: row.comment_id,
@@ -331,6 +183,8 @@ function attachmentFromRow(row) {
     size: row.size,
     createdAt: row.created_at,
   };
+  Object.defineProperty(attachment, "changeRevision", { value: row.change_revision });
+  return attachment;
 }
 
 function projectFromRow(row) {
@@ -356,11 +210,12 @@ function projectSummaryFromRow(row) {
   };
 }
 
-function workflowWorkspaceFromRow(row) {
+function projectReadmeFromRow(row, projectId) {
   return {
-    projectId: row.project_id,
-    workspace: JSON.parse(row.workspace),
+    projectId: row.project_id ?? projectId,
+    content: row.content,
     version: row.version,
+    createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
@@ -386,6 +241,9 @@ function aiChatThreadFromRow(row) {
       projectId: row.origin_project_id,
       projectName: row.origin_project_name,
       workspacePath: row.origin_workspace_path,
+      ...(row.origin_codex_project_id ? { codexProjectId: row.origin_codex_project_id } : {}),
+      ...(row.origin_codex_project_kind ? { codexProjectKind: row.origin_codex_project_kind } : {}),
+      ...(row.origin_codex_host_id ? { codexHostId: row.origin_codex_host_id } : {}),
       ...(row.origin_issue_id ? { issueId: row.origin_issue_id } : {}),
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
@@ -411,17 +269,6 @@ function aiChatEventFromRow(row) {
     data: row.data === null ? null : JSON.parse(row.data),
     createdAt: row.created_at,
   };
-}
-
-function projectPrefix(project) {
-  const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
-  const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
-  if (existingPrefix && existingPrefix !== idPrefix) return existingPrefix;
-  if (idPrefix.length <= 5) return idPrefix;
-  const namePrefix = [...project.name.toUpperCase().replace(/[^\p{L}\p{N}]+/gu, "")]
-    .slice(0, 3)
-    .join("");
-  return namePrefix || idPrefix.slice(0, 3);
 }
 
 export class TaskboardDatabase {
@@ -473,7 +320,6 @@ export class TaskboardDatabase {
         assignee_id TEXT NOT NULL DEFAULT 'local-user',
         assignee_name TEXT NOT NULL DEFAULT '本地用户',
         assignee_avatar_url TEXT,
-        workflow_id TEXT,
         git_branch TEXT,
         worktree_path TEXT,
         worktree_branch TEXT,
@@ -510,7 +356,8 @@ export class TaskboardDatabase {
         author_avatar_url TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        change_revision INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE INDEX IF NOT EXISTS comments_task_created
@@ -567,17 +414,33 @@ export class TaskboardDatabase {
         filename TEXT NOT NULL,
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        change_revision INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE INDEX IF NOT EXISTS attachments_task_created
         ON attachments(task_id, created_at, id);
 
-      CREATE TABLE IF NOT EXISTS workflow_workspaces (
+      CREATE TABLE IF NOT EXISTS comment_attachment_revision (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        value INTEGER NOT NULL CHECK (value >= 0)
+      );
+
+      CREATE TABLE IF NOT EXISTS project_readmes (
         project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-        workspace TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS project_readme_attachments (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        size INTEGER NOT NULL CHECK (size >= 0),
+        created_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS project_summaries (
@@ -595,6 +458,9 @@ export class TaskboardDatabase {
         origin_project_id TEXT NOT NULL,
         origin_project_name TEXT NOT NULL,
         origin_workspace_path TEXT NOT NULL,
+        origin_codex_project_id TEXT,
+        origin_codex_project_kind TEXT,
+        origin_codex_host_id TEXT,
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
         codex_thread_id TEXT,
@@ -650,7 +516,23 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
 
+    const aiChatThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    for (const column of [
+      "origin_codex_project_id",
+      "origin_codex_project_kind",
+      "origin_codex_host_id",
+    ]) {
+      if (!aiChatThreadColumns.some((candidate) => candidate.name === column)) {
+        this.database.exec(`ALTER TABLE ai_chat_threads ADD COLUMN ${column} TEXT`);
+      }
+    }
+
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    const hasWorkflowId = taskColumns.some((column) => column.name === "workflow_id");
+    if (hasWorkflowId) {
+      this.database.exec("ALTER TABLE tasks DROP COLUMN workflow_id");
+    }
+    this.database.exec("DROP TABLE IF EXISTS workflow_workspaces");
     const hasThreadId = taskColumns.some((column) => column.name === "thread_id");
     const hasLinkedThreadId = taskColumns.some((column) => column.name === "linked_thread_id");
     if (!hasThreadId) {
@@ -666,6 +548,10 @@ export class TaskboardDatabase {
         this.database.exec(`ALTER TABLE tasks ADD COLUMN ${column} TEXT`);
       }
     }
+    this.database.exec(`
+      DROP TRIGGER IF EXISTS tasks_todo_execution_target_insert;
+      DROP TRIGGER IF EXISTS tasks_todo_execution_target_update;
+    `);
     if (hasLinkedThreadId) {
       this.database.exec(`
         UPDATE tasks
@@ -707,9 +593,6 @@ export class TaskboardDatabase {
     }
     if (!migratedTaskColumns.some((column) => column.name === "creator_avatar_url")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN creator_avatar_url TEXT");
-    }
-    if (!migratedTaskColumns.some((column) => column.name === "workflow_id")) {
-      this.database.exec("ALTER TABLE tasks ADD COLUMN workflow_id TEXT");
     }
     if (!migratedTaskColumns.some((column) => column.name === "external_source")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN external_source TEXT");
@@ -801,6 +684,7 @@ export class TaskboardDatabase {
         relation_type TEXT NOT NULL CHECK (relation_type IN ('parent', 'blocks', 'related')),
         source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         target_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        origin TEXT NOT NULL DEFAULT 'manual' CHECK (origin IN ('manual', 'mention')),
         created_at TEXT NOT NULL,
         CHECK (source_task_id <> target_task_id),
         CHECK (relation_type <> 'related' OR source_task_id < target_task_id),
@@ -813,7 +697,49 @@ export class TaskboardDatabase {
       CREATE UNIQUE INDEX IF NOT EXISTS task_relations_one_parent
         ON task_relations(target_task_id)
         WHERE relation_type = 'parent';
+
+      CREATE TRIGGER IF NOT EXISTS task_relations_require_same_project
+      BEFORE INSERT ON task_relations
+      BEGIN
+        SELECT RAISE(ABORT, 'CROSS_PROJECT_RELATION')
+        WHERE EXISTS (
+          SELECT 1
+          FROM tasks AS source
+          JOIN tasks AS target ON target.id = NEW.target_task_id
+          WHERE source.id = NEW.source_task_id
+            AND source.project_id != target.project_id
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS task_relations_prevent_parent_cycle
+      BEFORE INSERT ON task_relations
+      WHEN NEW.relation_type = 'parent'
+      BEGIN
+        SELECT RAISE(ABORT, 'RELATION_CYCLE')
+        WHERE EXISTS (
+          WITH RECURSIVE ancestors(id) AS (
+            SELECT source_task_id
+            FROM task_relations
+            WHERE relation_type = 'parent' AND target_task_id = NEW.source_task_id
+            UNION
+            SELECT task_relations.source_task_id
+            FROM task_relations
+            JOIN ancestors ON task_relations.target_task_id = ancestors.id
+            WHERE task_relations.relation_type = 'parent'
+          )
+          SELECT 1 FROM ancestors WHERE id = NEW.target_task_id
+        );
+      END;
     `);
+
+    const taskRelationColumns = this.database.prepare("PRAGMA table_info(task_relations)").all();
+    if (!taskRelationColumns.some((column) => column.name === "origin")) {
+      this.database.exec(`
+        ALTER TABLE task_relations
+        ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'
+          CHECK (origin IN ('manual', 'mention'))
+      `);
+    }
 
     const commentColumns = this.database.prepare("PRAGMA table_info(comments)").all();
     if (!commentColumns.some((column) => column.name === "thread_id")) {
@@ -834,6 +760,9 @@ export class TaskboardDatabase {
     }
     if (!commentColumns.some((column) => column.name === "author_avatar_url")) {
       this.database.exec("ALTER TABLE comments ADD COLUMN author_avatar_url TEXT");
+    }
+    if (!commentColumns.some((column) => column.name === "change_revision")) {
+      this.database.exec("ALTER TABLE comments ADD COLUMN change_revision INTEGER NOT NULL DEFAULT 0");
     }
     this.database.exec(`
       UPDATE comments
@@ -900,7 +829,26 @@ export class TaskboardDatabase {
           )
       `);
     }
+    if (!attachmentColumns.some((column) => column.name === "change_revision")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN change_revision INTEGER NOT NULL DEFAULT 0");
+    }
+    this.database.exec("CREATE INDEX IF NOT EXISTS comments_task_change_revision ON comments(task_id, change_revision)");
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
+    this.database.exec("CREATE INDEX IF NOT EXISTS attachments_task_change_revision ON attachments(task_id, change_revision) WHERE comment_id IS NULL");
+    this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_change_revision ON attachments(comment_id, change_revision) WHERE comment_id IS NOT NULL");
+    const maxChangeRevision = this.database.prepare(`
+      SELECT MAX(change_revision) AS value
+      FROM (
+        SELECT change_revision FROM comments
+        UNION ALL
+        SELECT change_revision FROM attachments
+      )
+    `).get().value ?? 0;
+    this.database.prepare(`
+      INSERT INTO comment_attachment_revision (id, value)
+      VALUES (1, ?)
+      ON CONFLICT(id) DO UPDATE SET value = MAX(value, excluded.value)
+    `).run(maxChangeRevision);
 
     if (!resumeRequestsTableExisted) {
       this.#backfillTaskResumeRequests();
@@ -928,7 +876,6 @@ export class TaskboardDatabase {
       SELECT id, project_id, thread_id, version
       FROM tasks
       WHERE status = 'todo' AND archived_at IS NULL AND thread_id IS NOT NULL
-        AND (thread_codex_host_id IS NULL OR thread_codex_host_id = 'local')
         AND NOT EXISTS (
           SELECT 1 FROM task_resume_requests
           WHERE task_id = tasks.id
@@ -1148,7 +1095,7 @@ export class TaskboardDatabase {
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
-          workflow_id, git_branch, worktree_path, worktree_branch,
+          git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           external_source, external_origin, external_id, external_key, external_url,
           archived_at, version, created_at, updated_at
@@ -1157,7 +1104,7 @@ export class TaskboardDatabase {
           ?, NULL, NULL, NULL, NULL, NULL,
           ?, ?, ?, ?,
           ?, ?, ?, ?,
-          NULL, NULL, NULL, NULL,
+          NULL, NULL, NULL,
           NULL, ?, NULL, NULL,
           'jira', ?, ?, ?, ?,
           NULL, 1, ?, ?
@@ -1433,21 +1380,21 @@ export class TaskboardDatabase {
     return this.getProjectSummary(projectId);
   }
 
-  getWorkflowWorkspace(projectId) {
+  getProjectReadme(projectId) {
     if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
     const row = this.database.prepare(`
-      SELECT project_id, workspace, version, updated_at
-      FROM workflow_workspaces
+      SELECT project_id, content, version, created_at, updated_at
+      FROM project_readmes
       WHERE project_id = ?
     `).get(projectId);
     return row
-      ? workflowWorkspaceFromRow(row)
-      : { projectId, workspace: null, version: 0, updatedAt: null };
+      ? projectReadmeFromRow(row, projectId)
+      : { projectId, content: "", version: 0, createdAt: null, updatedAt: null };
   }
 
-  saveWorkflowWorkspace(projectId, expectedVersion, workspace) {
+  saveProjectReadme(projectId, content, expectedVersion) {
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -1455,33 +1402,65 @@ export class TaskboardDatabase {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
       }
       const current = this.database.prepare(`
-        SELECT version FROM workflow_workspaces WHERE project_id = ?
+        SELECT version FROM project_readmes WHERE project_id = ?
       `).get(projectId);
-      const actualVersion = current?.version ?? 0;
-      if (actualVersion !== expectedVersion) {
-        throw new ApiError(409, "VERSION_CONFLICT", "Workflow was changed by another client", {
-          expectedVersion,
-          actualVersion,
-        });
+      if (expectedVersion !== undefined) {
+        const actualVersion = current?.version ?? 0;
+        if (actualVersion !== expectedVersion) {
+          throw new ApiError(409, "VERSION_CONFLICT", "Project README changed since it was last read", {
+            expectedVersion,
+            actualVersion,
+          });
+        }
       }
       if (current) {
+        const versionCondition = expectedVersion !== undefined ? " AND version = ?" : "";
+        const params = expectedVersion !== undefined
+          ? [content, timestamp, projectId, expectedVersion]
+          : [content, timestamp, projectId];
         this.database.prepare(`
-          UPDATE workflow_workspaces
-          SET workspace = ?, version = version + 1, updated_at = ?
-          WHERE project_id = ? AND version = ?
-        `).run(JSON.stringify(workspace), timestamp, projectId, expectedVersion);
+          UPDATE project_readmes
+          SET content = ?, version = version + 1, updated_at = ?
+          WHERE project_id = ?${versionCondition}
+        `).run(...params);
       } else {
         this.database.prepare(`
-          INSERT INTO workflow_workspaces (project_id, workspace, version, updated_at)
-          VALUES (?, ?, 1, ?)
-        `).run(projectId, JSON.stringify(workspace), timestamp);
+          INSERT INTO project_readmes (project_id, content, version, created_at, updated_at)
+          VALUES (?, ?, 1, ?, ?)
+        `).run(projectId, content, timestamp, timestamp);
       }
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
     }
-    return this.getWorkflowWorkspace(projectId);
+    return this.getProjectReadme(projectId);
+  }
+
+  createProjectReadmeAttachment(projectId, input) {
+    if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    this.database.prepare(`
+      INSERT INTO project_readme_attachments (
+        id, project_id, filename, content_type, size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      input.id,
+      projectId,
+      input.filename,
+      input.contentType,
+      input.size,
+      now(),
+    );
+    return this.getProjectReadmeAttachment(input.id);
+  }
+
+  getProjectReadmeAttachment(id) {
+    const row = this.database.prepare(`
+      SELECT * FROM project_readme_attachments WHERE id = ?
+    `).get(id);
+    return row ? projectReadmeAttachmentFromRow(row) : null;
   }
 
   listAiChatThreads() {
@@ -1544,10 +1523,11 @@ export class TaskboardDatabase {
       INSERT INTO ai_chat_threads (
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
+        origin_codex_project_id, origin_codex_project_kind, origin_codex_host_id,
         origin_issue_id, origin_issue_identifier,
         codex_thread_id, model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
@@ -1555,6 +1535,9 @@ export class TaskboardDatabase {
       input.origin.projectId,
       input.origin.projectName,
       input.origin.workspacePath,
+      input.origin.codexProjectId ?? null,
+      input.origin.codexProjectKind ?? null,
+      input.origin.codexHostId ?? null,
       input.origin.issueId ?? null,
       input.origin.issueIdentifier ?? null,
       input.codexThreadId ?? null,
@@ -1794,17 +1777,25 @@ export class TaskboardDatabase {
         id
     `;
     const rows = this.database.prepare(sql).all(...values);
+    const relationsByTask = this.#taskRelationsForTasks(rows.map((row) => row.id));
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
     const resumeRequestsByTask = this.#resumeRequestsForTasks(rows.map((row) => row.id));
     return rows.map((row) => attachTaskActivity(
-      this.#taskWithRelations(row),
+      this.#taskWithRelations(row, relationsByTask.get(row.id)),
       commentsByTask.get(row.id) ?? [],
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
       resumeRequestsByTask.get(row.id) ?? null,
     ));
+  }
+
+  getTaskSource(id) {
+    const row = this.database.prepare(
+      "SELECT external_source FROM tasks WHERE id = ? OR identifier = ?",
+    ).get(id, id);
+    return row ? (row.external_source === "jira" ? "jira" : "local") : null;
   }
 
   getTask(id) {
@@ -1936,7 +1927,6 @@ export class TaskboardDatabase {
         || task.archivedAt !== null
         || task.status !== "todo"
         || task.threadId !== request.thread_id
-        || (task.threadBinding && task.threadBinding.codexHostId !== "local")
       ) {
         throw new ApiError(409, "RESUME_REQUEST_NOT_RETRYABLE", "Resume request cannot be retried");
       }
@@ -1970,6 +1960,70 @@ export class TaskboardDatabase {
       WHERE status IN ('pending', 'dispatching', 'dispatched')
       ORDER BY thread_id
     `).all().map((row) => row.thread_id);
+  }
+
+  getTaskTree(id, direction, depth) {
+    const root = this.database.prepare(
+      "SELECT * FROM tasks WHERE id = ? OR identifier = ?",
+    ).get(id, id);
+    if (!root) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+
+    const nodes = [taskTreeNode(root, null, 0, [root.id])];
+    const seen = new Set([root.id]);
+    let frontier = [nodes[0]];
+    const relationJoin = direction === "descendants"
+      ? `
+        FROM task_relations
+        JOIN tasks ON tasks.id = task_relations.target_task_id
+        WHERE task_relations.relation_type = 'parent'
+          AND task_relations.source_task_id IN (%PLACEHOLDERS%)
+      `
+      : `
+        FROM task_relations
+        JOIN tasks ON tasks.id = task_relations.source_task_id
+        WHERE task_relations.relation_type = 'parent'
+          AND task_relations.target_task_id IN (%PLACEHOLDERS%)
+      `;
+    const parentColumn = direction === "descendants"
+      ? "task_relations.source_task_id"
+      : "task_relations.target_task_id";
+
+    for (let level = 1; level <= depth && frontier.length > 0; level += 1) {
+      const placeholders = frontier.map(() => "?").join(", ");
+      const rows = this.database.prepare(`
+        SELECT tasks.*, ${parentColumn} AS tree_parent_id
+        ${relationJoin.replace("%PLACEHOLDERS%", placeholders)}
+        ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+      `).all(...frontier.map((node) => node.id));
+      const rowsByParent = new Map();
+      for (const row of rows) {
+        const siblings = rowsByParent.get(row.tree_parent_id) ?? [];
+        siblings.push(row);
+        rowsByParent.set(row.tree_parent_id, siblings);
+      }
+      const next = [];
+      for (const parent of frontier) {
+        for (const row of rowsByParent.get(parent.id) ?? []) {
+          if (seen.has(row.id)) continue;
+          if (nodes.length >= TASK_TREE_MAX_NODES) {
+            throw new ApiError(413, "TREE_TOO_LARGE", `Task tree cannot exceed ${TASK_TREE_MAX_NODES} nodes`);
+          }
+          const node = taskTreeNode(row, parent.id, level, [...parent.path, row.id]);
+          nodes.push(node);
+          next.push(node);
+          seen.add(row.id);
+        }
+      }
+      frontier = next;
+    }
+
+    return {
+      rootId: root.id,
+      direction,
+      depth,
+      nodeCount: nodes.length,
+      nodes,
+    };
   }
 
   createTask(input) {
@@ -2030,10 +2084,10 @@ export class TaskboardDatabase {
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
-          workflow_id, git_branch, worktree_path, worktree_branch,
+          git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -2053,7 +2107,6 @@ export class TaskboardDatabase {
         input.assignee.id,
         input.assignee.name,
         input.assignee.avatarUrl,
-        input.workflowId,
         input.developmentContext?.type === "branch" ? input.developmentContext.branch : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.path : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.branch : null,
@@ -2073,7 +2126,7 @@ export class TaskboardDatabase {
   }
 
   updateTask(id, version, changes, threadId, threadBinding, actor) {
-    const current = this.#requireTask(id);
+    const current = this.#requireTaskRecord(id);
     this.#requireVersion(current, version);
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
@@ -2118,7 +2171,6 @@ export class TaskboardDatabase {
       status: "status",
       priority: "priority",
       labels: "labels",
-      workflowId: "workflow_id",
       startDate: "start_date",
       dueDate: "due_date",
     };
@@ -2162,7 +2214,7 @@ export class TaskboardDatabase {
       assignments.push("sort_order = ?");
       values.push(row.minimum === null ? 1000 : row.minimum - 1000);
     }
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     if (storedBinding && !Object.hasOwn(changes, "projectId")) {
       assignments.push(
         "thread_id = ?",
@@ -2187,21 +2239,14 @@ export class TaskboardDatabase {
       }
       const nextProjectId = projectChanged ? targetProject.id : current.projectId;
       const nextStatus = Object.hasOwn(changes, "status") ? changes.status : current.status;
-      const currentStoredBinding = [
-        current.threadId,
-        current.threadBinding?.codexProjectId ?? null,
-        current.threadBinding?.codexProjectKind ?? null,
-        current.threadBinding?.codexHostId ?? null,
-        current.threadBinding?.workspacePath ?? null,
-      ];
-      const nextStoredBinding = storedBinding && !Object.hasOwn(changes, "projectId")
-        ? storedBinding
-        : currentStoredBinding;
+      const nextThreadId = threadId !== undefined && !Object.hasOwn(changes, "projectId")
+        ? threadId
+        : current.threadId;
       this.#settleResumeRequestsForTask(
         current,
         nextProjectId,
         nextStatus,
-        nextStoredBinding,
+        nextThreadId,
         actor,
         timestamp,
       );
@@ -2254,7 +2299,7 @@ export class TaskboardDatabase {
     }
 
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2273,13 +2318,7 @@ export class TaskboardDatabase {
         current,
         current.projectId,
         status,
-        storedBinding ?? [
-          current.threadId,
-          current.threadBinding?.codexProjectId ?? null,
-          current.threadBinding?.codexProjectKind ?? null,
-          current.threadBinding?.codexHostId ?? null,
-          current.threadBinding?.workspacePath ?? null,
-        ],
+        threadId ?? current.threadId,
         actor,
         timestamp,
       );
@@ -2301,7 +2340,7 @@ export class TaskboardDatabase {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2343,7 +2382,7 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
     }
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2395,7 +2434,7 @@ export class TaskboardDatabase {
     }
   }
 
-  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor) {
+  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual") {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2441,9 +2480,9 @@ export class TaskboardDatabase {
         : null;
       this.database.prepare(`
         INSERT INTO task_relations (
-          relation_type, source_task_id, target_task_id, created_at
-        ) VALUES (?, ?, ?, ?)
-      `).run(relationType, sourceTaskId, targetTaskId, timestamp);
+          relation_type, source_task_id, target_task_id, origin, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(relationType, sourceTaskId, targetTaskId, origin, timestamp);
       this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
@@ -2461,7 +2500,7 @@ export class TaskboardDatabase {
     }
   }
 
-  removeTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor) {
+  removeTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2473,12 +2512,72 @@ export class TaskboardDatabase {
         task.id,
         relatedTask.id,
       );
-      const removed = this.database.prepare(`
-        DELETE FROM task_relations
+      const relation = this.database.prepare(`
+        SELECT origin
+        FROM task_relations
         WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
-      `).run(relationType, sourceTaskId, targetTaskId);
-      if (removed.changes !== 1) {
+      `).get(relationType, sourceTaskId, targetTaskId);
+      if (!relation) {
         throw new ApiError(404, "RELATION_NOT_FOUND", "This issue relation does not exist");
+      }
+      if (origin && relation.origin !== origin) {
+        this.database.exec("COMMIT");
+        return {
+          task: this.getTask(task.id),
+          relatedTask: this.getTask(relatedTask.id),
+        };
+      }
+      let deleted;
+      if (origin === "mention" && relationType === "related") {
+        const taskReference = `](?${new URLSearchParams({
+          project: task.projectId,
+          issue: relatedTask.identifier,
+        })})`;
+        const relatedTaskReference = `](?${new URLSearchParams({
+          project: task.projectId,
+          issue: task.identifier,
+        })})`;
+        deleted = this.database.prepare(`
+          DELETE FROM task_relations
+          WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
+            AND origin = 'mention'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM tasks
+              WHERE (id = ? AND instr(description, ?) > 0)
+                OR (id = ? AND instr(description, ?) > 0)
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM comments
+              WHERE (task_id = ? AND instr(body, ?) > 0)
+                OR (task_id = ? AND instr(body, ?) > 0)
+            )
+        `).run(
+          relationType,
+          sourceTaskId,
+          targetTaskId,
+          task.id,
+          taskReference,
+          relatedTask.id,
+          relatedTaskReference,
+          task.id,
+          taskReference,
+          relatedTask.id,
+          relatedTaskReference,
+        );
+      } else {
+        deleted = this.database.prepare(`
+          DELETE FROM task_relations
+          WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
+        `).run(relationType, sourceTaskId, targetTaskId);
+      }
+      if (origin === "mention" && relationType === "related" && deleted.changes === 0) {
+        this.database.exec("COMMIT");
+        return {
+          task: this.getTask(task.id),
+          relatedTask: this.getTask(relatedTask.id),
+        };
       }
       const timestamp = now();
       this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
@@ -2508,37 +2607,58 @@ export class TaskboardDatabase {
   }
 
   listComments(taskId) {
-    const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    const task = this.#requireTaskRecord(taskId);
+    const rows = this.database.prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
       ORDER BY created_at, id
-    `).all(task.id).map((row) => this.#commentWithAttachments(row));
+    `).all(task.id);
+    return this.#commentsWithAttachments(rows);
+  }
+
+  listCommentsAfter(taskId, after) {
+    const task = this.#requireTaskRecord(taskId);
+    const rows = this.database.prepare(`
+      SELECT * FROM comments
+      WHERE task_id = ?
+        AND change_revision > ?
+      ORDER BY change_revision
+    `).all(task.id, after.revision);
+    return this.#commentsWithAttachments(rows);
   }
 
   createComment(taskId, input) {
-    const task = this.#requireTask(taskId);
     const id = randomUUID();
     const timestamp = now();
-    this.database.prepare(`
-      INSERT INTO comments (
-        id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
-        thread_codex_host_id, thread_workspace_path,
-        author_type, author_id, author_name, author_avatar_url,
-        version, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-    `).run(
-      id,
-      task.id,
-      input.body,
-      ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
-      input.actor.type,
-      input.actor.id,
-      input.actor.name,
-      input.actor.avatarUrl,
-      timestamp,
-      timestamp,
-    );
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
+          thread_codex_host_id, thread_workspace_path,
+          author_type, author_id, author_name, author_avatar_url,
+          version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        id,
+        task.id,
+        input.body,
+        ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
+        input.actor.type,
+        input.actor.id,
+        input.actor.name,
+        input.actor.avatarUrl,
+        timestamp,
+        timestamp,
+        changeRevision,
+      );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
     return this.getComment(id);
   }
 
@@ -2548,20 +2668,29 @@ export class TaskboardDatabase {
   }
 
   updateComment(id, version, body, threadId, threadBinding) {
-    const current = this.#requireComment(id);
-    this.#requireCommentVersion(current, version);
     const storedBinding = storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
-    const result = this.database.prepare(`
-      UPDATE comments
-      SET body = ?, ${threadAssignment} version = version + 1, updated_at = ?
-      WHERE id = ? AND version = ?
-    `).run(body, ...(storedBinding ?? []), now(), id, version);
-    if (result.changes !== 1) {
-      this.#throwMissingCommentOrConflict(id, version);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireComment(id);
+      this.#requireCommentVersion(current, version);
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      const result = this.database.prepare(`
+        UPDATE comments
+        SET body = ?, ${threadAssignment} version = version + 1, updated_at = ?,
+          change_revision = ?
+        WHERE id = ? AND version = ?
+      `).run(body, ...(storedBinding ?? []), now(), changeRevision, id, version);
+      if (result.changes !== 1) {
+        this.#throwMissingCommentOrConflict(id, version);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
     return this.getComment(id);
   }
@@ -2578,8 +2707,16 @@ export class TaskboardDatabase {
     return current;
   }
 
-  listAttachments(taskId) {
+  listAttachments(taskId, after = null) {
     const task = this.#requireTask(taskId);
+    if (after) {
+      return this.database.prepare(`
+        SELECT * FROM attachments
+        WHERE task_id = ? AND comment_id IS NULL
+          AND change_revision > ?
+        ORDER BY change_revision
+      `).all(task.id, after.revision).map(attachmentFromRow);
+    }
     return this.database.prepare(`
       SELECT * FROM attachments
       WHERE task_id = ? AND comment_id IS NULL
@@ -2588,28 +2725,65 @@ export class TaskboardDatabase {
   }
 
   createAttachment(taskId, input) {
-    const task = this.#requireTask(taskId);
-    this.database.prepare(`
-      INSERT INTO attachments (id, task_id, comment_id, kind, filename, content_type, size, created_at)
-      VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
-    `).run(input.id, task.id, input.kind, input.filename, input.contentType, input.size, now());
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO attachments (
+          id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.id,
+        task.id,
+        input.kind,
+        input.filename,
+        input.contentType,
+        input.size,
+        now(),
+        changeRevision,
+      );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
     return this.getAttachment(input.id);
   }
 
-  listCommentAttachments(commentId) {
+  listCommentAttachments(commentId, after = null) {
     const comment = this.database.prepare("SELECT id FROM comments WHERE id = ?").get(commentId);
     if (!comment) {
       throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${commentId}' does not exist`);
     }
-    return this.#attachmentsForComment(commentId);
+    return this.#attachmentsForComment(commentId, after);
   }
 
   createCommentAttachment(commentId, input) {
-    const comment = this.#requireComment(commentId);
-    this.database.prepare(`
-      INSERT INTO attachments (id, task_id, comment_id, kind, filename, content_type, size, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(input.id, comment.taskId, comment.id, input.kind, input.filename, input.contentType, input.size, now());
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const comment = this.#requireComment(commentId);
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO attachments (
+          id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.id,
+        comment.taskId,
+        comment.id,
+        input.kind,
+        input.filename,
+        input.contentType,
+        input.size,
+        now(),
+        changeRevision,
+      );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
     return this.getAttachment(input.id);
   }
 
@@ -2627,10 +2801,28 @@ export class TaskboardDatabase {
     return attachment;
   }
 
-  #commentWithAttachments(row) {
+  #commentWithAttachments(row, attachments = this.#attachmentsForComment(row.id)) {
     const comment = commentFromRow(row);
-    comment.attachments = this.#attachmentsForComment(comment.id);
+    comment.attachments = attachments;
     return comment;
+  }
+
+  #commentsWithAttachments(rows) {
+    const attachmentsByComment = new Map(rows.map((row) => [row.id, []]));
+    const commentIds = rows.map((row) => row.id);
+    for (let offset = 0; offset < commentIds.length; offset += 400) {
+      const chunk = commentIds.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const attachments = this.database.prepare(`
+        SELECT * FROM attachments
+        WHERE comment_id IN (${placeholders})
+        ORDER BY comment_id, created_at, id
+      `).all(...chunk);
+      for (const attachment of attachments) {
+        attachmentsByComment.get(attachment.comment_id).push(attachmentFromRow(attachment));
+      }
+    }
+    return rows.map((row) => this.#commentWithAttachments(row, attachmentsByComment.get(row.id)));
   }
 
   #aiChatThreadWithCurrentRun(row) {
@@ -2726,15 +2918,7 @@ export class TaskboardDatabase {
         WHERE attachments.task_id IN (${placeholders})
           AND attachments.comment_id IS NULL
           AND attachments.content_type LIKE 'image/%'
-          AND (
-            attachments.kind = 'attachment'
-            OR instr(tasks.description, 'api/attachments/' || attachments.id || '/content') > 0
-            OR EXISTS (
-              SELECT 1 FROM comments
-              WHERE comments.task_id = attachments.task_id
-                AND instr(comments.body, 'api/attachments/' || attachments.id || '/content') > 0
-            )
-          )
+          AND instr(tasks.description, 'api/attachments/' || attachments.id || '/content') > 0
         ORDER BY attachments.task_id, attachments.created_at, attachments.id
       `).all(...chunk);
       for (const row of rows) {
@@ -2744,14 +2928,8 @@ export class TaskboardDatabase {
     return imagesByTask;
   }
 
-  #createResumeRequestForTodo(current, nextVersion, threadBinding, timestamp) {
-    const [threadId, , , codexHostId] = threadBinding;
-    if (
-      current.status === "todo"
-      || current.archivedAt !== null
-      || !threadId
-      || (codexHostId !== null && codexHostId !== "local")
-    ) return;
+  #createResumeRequestForTodo(current, nextVersion, threadId, timestamp) {
+    if (current.status === "todo" || current.archivedAt !== null || !threadId) return;
     this.database.prepare(`
       INSERT INTO task_resume_requests (
         id, task_id, project_id, thread_id, task_version, status,
@@ -2768,18 +2946,10 @@ export class TaskboardDatabase {
     );
   }
 
-  #settleResumeRequestsForTask(current, nextProjectId, nextStatus, nextThreadBinding, actor, timestamp) {
-    const currentThreadBinding = [
-      current.threadId,
-      current.threadBinding?.codexProjectId ?? null,
-      current.threadBinding?.codexProjectKind ?? null,
-      current.threadBinding?.codexHostId ?? null,
-      current.threadBinding?.workspacePath ?? null,
-    ];
-    const nextThreadId = nextThreadBinding[0];
+  #settleResumeRequestsForTask(current, nextProjectId, nextStatus, nextThreadId, actor, timestamp) {
     const bindingChanged = (
       nextProjectId !== current.projectId
-      || nextThreadBinding.some((value, index) => value !== currentThreadBinding[index])
+      || nextThreadId !== current.threadId
     );
     if (current.status !== "todo" && nextStatus === "todo") {
       if (bindingChanged) {
@@ -2793,7 +2963,7 @@ export class TaskboardDatabase {
       this.#createResumeRequestForTodo(
         { ...current, projectId: nextProjectId },
         current.version + 1,
-        nextThreadBinding,
+        nextThreadId,
         timestamp,
       );
       return;
@@ -2816,7 +2986,6 @@ export class TaskboardDatabase {
       && actor.id === "codex-agent"
       && nextProjectId === current.projectId
       && nextThreadId
-      && !bindingChanged
     ) {
       const acknowledged = this.database.prepare(`
         UPDATE task_resume_requests
@@ -2854,7 +3023,15 @@ export class TaskboardDatabase {
     ).get(id));
   }
 
-  #attachmentsForComment(commentId) {
+  #attachmentsForComment(commentId, after = null) {
+    if (after) {
+      return this.database.prepare(`
+        SELECT * FROM attachments
+        WHERE comment_id = ?
+          AND change_revision > ?
+        ORDER BY change_revision
+      `).all(commentId, after.revision).map(attachmentFromRow);
+    }
     return this.database.prepare(`
       SELECT * FROM attachments
       WHERE comment_id = ?
@@ -2862,60 +3039,31 @@ export class TaskboardDatabase {
     `).all(commentId).map(attachmentFromRow);
   }
 
-  #taskWithRelations(row) {
+  #nextCommentAttachmentRevision() {
+    return this.database.prepare(`
+      UPDATE comment_attachment_revision
+      SET value = value + 1
+      WHERE id = 1
+      RETURNING value
+    `).get().value;
+  }
+
+  #taskRelationsForTasks(taskIds) {
+    const relationsByTask = new Map();
+    for (let offset = 0; offset < taskIds.length; offset += 400) {
+      const chunk = taskIds.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.database.prepare(taskRelationsQuery(placeholders)).all(...chunk);
+      for (const [taskId, relations] of taskRelationsFromRows(chunk, rows, taskRelationSummaryFromRow)) {
+        relationsByTask.set(taskId, relations);
+      }
+    }
+    return relationsByTask;
+  }
+
+  #taskWithRelations(row, relations = this.#taskRelationsForTasks([row.id]).get(row.id)) {
     const task = taskFromRow(row);
-    const parent = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.source_task_id
-      WHERE task_relations.relation_type = 'parent'
-        AND task_relations.target_task_id = ?
-    `).get(task.id);
-    const subIssues = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.target_task_id
-      WHERE task_relations.relation_type = 'parent'
-        AND task_relations.source_task_id = ?
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id);
-    const blockedBy = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.source_task_id
-      WHERE task_relations.relation_type = 'blocks'
-        AND task_relations.target_task_id = ?
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id);
-    const blocks = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.target_task_id
-      WHERE task_relations.relation_type = 'blocks'
-        AND task_relations.source_task_id = ?
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id);
-    const related = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = CASE
-        WHEN task_relations.source_task_id = ? THEN task_relations.target_task_id
-        ELSE task_relations.source_task_id
-      END
-      WHERE task_relations.relation_type = 'related'
-        AND (
-          task_relations.source_task_id = ?
-          OR task_relations.target_task_id = ?
-        )
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id, task.id, task.id);
-    task.relations = {
-      parent: parent ? taskRelationSummaryFromRow(parent) : null,
-      subIssues: subIssues.map(taskRelationSummaryFromRow),
-      blockedBy: blockedBy.map(taskRelationSummaryFromRow),
-      blocks: blocks.map(taskRelationSummaryFromRow),
-      related: related.map(taskRelationSummaryFromRow),
-    };
+    task.relations = relations;
     return task;
   }
 
@@ -2992,7 +3140,8 @@ export class TaskboardDatabase {
   }
 
   #touchTask(id, version, threadId, threadBinding, timestamp) {
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const current = this.#requireTask(id);
+    const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -3005,6 +3154,14 @@ export class TaskboardDatabase {
     if (result.changes !== 1) {
       this.#throwMissingOrConflict(id, version);
     }
+  }
+
+  #requireTaskRecord(id) {
+    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    if (!row) {
+      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+    }
+    return taskFromRow(row);
   }
 
   #requireTask(id) {
@@ -3042,10 +3199,7 @@ export class TaskboardDatabase {
   }
 
   #throwMissingOrConflict(id, expectedVersion) {
-    const task = this.getTask(id);
-    if (!task) {
-      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-    }
+    const task = this.#requireTaskRecord(id);
     throw new ApiError(409, "VERSION_CONFLICT", "Task was changed by another client", {
       expectedVersion,
       actualVersion: task.version,

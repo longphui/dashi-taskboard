@@ -1,3 +1,4 @@
+import { listenForOutsidePointerDown, listenForMenuViewportChange } from "../menuEvents";
 import {
   useEffect,
   useLayoutEffect,
@@ -21,7 +22,6 @@ import {
   matchesTaskFilters,
   matchesTaskSearch,
   taskFilterCount,
-  type TaskFilterKey,
   type TaskFilters,
 } from "../taskFilters";
 import {
@@ -31,7 +31,8 @@ import {
   type TaskPriority,
   type TaskStatus,
 } from "../types";
-import { LinearIcon, LinearPriorityIcon, LinearStatusIcon } from "./LinearIcon";
+import { LinearIcon } from "./LinearIcon";
+import { LabelIcon, PriorityIcon, StatusIcon } from "./SemanticIcons";
 import { TaskboardIcon } from "./TaskboardIcon";
 
 type SubmenuName = "statuses" | "priorities" | "labels";
@@ -112,13 +113,33 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     hoverTimerRef.current = window.setTimeout(() => openSubmenu(name), 160);
   }
 
-  function countFor(key: TaskFilterKey, predicate: (task: Task) => boolean): number {
-    return tasks.filter(
-      (task) => matchesTaskSearch(task, search, language)
-        && matchesTaskFilters(task, filters, key)
-        && predicate(task),
-    ).length;
-  }
+  const searchMatches = useMemo(() => {
+    if (!open) return [];
+    const contentFilters = { ...EMPTY_TASK_FILTERS, content: filters.content };
+    return tasks.filter((task) => matchesTaskSearch(task, search, language)
+      && matchesTaskFilters(task, contentFilters));
+  }, [filters.content, language, open, search, tasks]);
+
+  const counts = useMemo(() => {
+    const statuses = new Map<TaskStatus, number>();
+    const priorities = new Map<TaskPriority, number>();
+    const labelCounts = new Map<string, number>();
+    const filtersWithoutContent = { ...filters, content: "" };
+    for (const task of searchMatches) {
+      if (matchesTaskFilters(task, filtersWithoutContent, "statuses")) {
+        statuses.set(task.status, (statuses.get(task.status) ?? 0) + 1);
+      }
+      if (matchesTaskFilters(task, filtersWithoutContent, "priorities")) {
+        priorities.set(task.priority, (priorities.get(task.priority) ?? 0) + 1);
+      }
+      if (matchesTaskFilters(task, filtersWithoutContent, "labels")) {
+        for (const label of task.labels) {
+          labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+        }
+      }
+    }
+    return { statuses, priorities, labels: labelCounts };
+  }, [filters, searchMatches]);
 
   function toggleStatus(status: TaskStatus) {
     const selected = new Set(filters.statuses);
@@ -146,32 +167,32 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     label: taskStatusLabel(language, status),
     category: text("状态", "Status"),
     keywords: status,
-    count: countFor("statuses", (task) => task.status === status),
+    count: counts.statuses.get(status) ?? 0,
     selected: filters.statuses.includes(status),
-    icon: <span className={`filter-status-icon status-${status}`}><LinearStatusIcon status={status} /></span>,
+    icon: <span className="filter-status-icon"><StatusIcon status={status} color="currentColor" /></span>,
     toggle: () => toggleStatus(status),
-  })), [filters, language, search, tasks, text]);
+  })), [counts, filters, language, text]);
 
   const priorityOptions = useMemo<FilterOption[]>(() => TASK_PRIORITIES.map((priority) => ({
     id: `priority-${priority}`,
     label: taskPriorityLabel(language, priority),
     category: text("优先级", "Priority"),
     keywords: priority,
-    count: countFor("priorities", (task) => task.priority === priority),
+    count: counts.priorities.get(priority) ?? 0,
     selected: filters.priorities.includes(priority),
-    icon: <LinearPriorityIcon priority={priority} />,
+    icon: <PriorityIcon priority={priority} />,
     toggle: () => togglePriority(priority),
-  })), [filters, language, search, tasks, text]);
+  })), [counts, filters, language, text]);
 
   const labelOptions = useMemo<FilterOption[]>(() => labels.map((label) => ({
     id: `label-${label}`,
     label: labelDisplayName(label, language),
     category: text("标签", "Label"),
-    count: countFor("labels", (task) => task.labels.includes(label)),
+    count: counts.labels.get(label) ?? 0,
     selected: filters.labels.includes(label),
     icon: <LabelGlyph label={label} />,
     toggle: () => toggleLabel(label),
-  })), [filters, labels, language, search, tasks, text]);
+  })), [counts, filters, labels, language, text]);
 
   const optionsBySubmenu: Partial<Record<SubmenuName, FilterOption[]>> = {
     statuses: statusOptions,
@@ -183,8 +204,8 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     {
       id: "statuses" as const,
       label: text("状态", "Status"),
-      keywords: "status workflow",
-      icon: <LinearStatusIcon status="todo" />,
+      keywords: "status state",
+      icon: <StatusIcon status="todo" color="currentColor" />,
       summary: joinSummary(
         filters.statuses.map((status) => taskStatusLabel(language, status)),
         text("状态", "statuses"),
@@ -195,7 +216,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
       id: "priorities" as const,
       label: text("优先级", "Priority"),
       keywords: "priority urgent high medium low",
-      icon: <LinearIcon name="priority" />,
+      icon: <PriorityIcon color="currentColor" />,
       summary: joinSummary(
         filters.priorities.map((priority) => taskPriorityLabel(language, priority)),
         text("优先级", "priorities"),
@@ -206,7 +227,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
       id: "labels" as const,
       label: text("标签", "Labels"),
       keywords: "label tag",
-      icon: <LinearIcon name="label" style={{ color: "inherit" }} />,
+      icon: <LabelIcon color="currentColor" />,
       summary: joinSummary(
         filters.labels.map((label) => labelDisplayName(label, language)),
         text("标签", "labels"),
@@ -278,25 +299,12 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     if (!open) return;
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLInputElement>(".task-filter-search input")?.focus());
 
-    function closeFromOutside(event: PointerEvent) {
-      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) {
-        closeMenu();
-      }
-    }
-    function closeFromViewportChange(event: Event) {
-      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
-      closeMenu();
-    }
+    const stopOutside = listenForOutsidePointerDown([menuRef, triggerRef], closeMenu);
+    const stopViewport = listenForMenuViewportChange(menuRef, closeMenu);
 
-    document.addEventListener("pointerdown", closeFromOutside);
-    window.addEventListener("blur", closeFromViewportChange);
-    window.addEventListener("resize", closeFromViewportChange);
-    window.addEventListener("scroll", closeFromViewportChange, true);
     return () => {
-      document.removeEventListener("pointerdown", closeFromOutside);
-      window.removeEventListener("blur", closeFromViewportChange);
-      window.removeEventListener("resize", closeFromViewportChange);
-      window.removeEventListener("scroll", closeFromViewportChange, true);
+      stopOutside();
+      stopViewport();
     };
   }, [open]);
 

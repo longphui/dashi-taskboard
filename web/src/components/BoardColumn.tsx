@@ -1,14 +1,10 @@
-import { useEffect, useState } from "react";
 import type { DragEvent } from "react";
+import { useTaskCardDragPreview } from "../useTaskCardDragPreview";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
 import { taskStatusLabel, useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
 import { TaskCard } from "./TaskCard";
-import {
-  TaskboardIcon,
-  taskboardIconSource,
-  type TaskboardIconName,
-} from "./TaskboardIcon";
+import { PlusIcon, StatusIcon } from "./SemanticIcons";
 
 export const STATUS_DETAILS: Record<
   TaskStatus,
@@ -23,51 +19,11 @@ export const STATUS_DETAILS: Record<
   canceled: { label: "取消", tone: "canceled" },
 };
 
-const STATUS_ICONS: Record<TaskStatus, TaskboardIconName> = {
-  backlog: "statusTodo",
-  todo: "statusTodo",
-  in_progress: "statusProgress",
-  in_review: "statusReview",
-  blocked: "statusBlocked",
-  done: "statusReview",
-  canceled: "statusBlocked",
-};
-
-const COLUMN_STATUS_ICONS: Record<TaskStatus, TaskboardIconName> = {
-  backlog: "statusTodo",
-  todo: "columnStatusTodo",
-  in_progress: "columnStatusProgress",
-  in_review: "columnStatusReview",
-  blocked: "columnStatusBlocked",
-  done: "statusReview",
-  canceled: "statusBlocked",
-};
-
-const COLUMN_ADD_ICONS: Partial<Record<TaskStatus, TaskboardIconName>> = {
-  todo: "columnAddTodo",
-  in_progress: "columnAddProgress",
-  in_review: "columnAddReview",
-  blocked: "columnAddBlocked",
-};
-
-export function statusIconSource(status: TaskStatus) {
-  return taskboardIconSource(STATUS_ICONS[status]);
-}
-
-export function StatusIcon({ status }: { status: TaskStatus }) {
-  return <TaskboardIcon name={STATUS_ICONS[status]} />;
-}
-
-export function ColumnStatusIcon({ status }: { status: TaskStatus }) {
-  return <TaskboardIcon name={COLUMN_STATUS_ICONS[status]} />;
-}
-
 interface BoardColumnProps {
   scrollRef: (element: HTMLDivElement | null) => void;
   status: TaskStatus;
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
-  now: number;
   emptyMessage: string;
   isDropTarget: boolean;
   draggedTaskId: string | null;
@@ -85,7 +41,7 @@ interface BoardColumnProps {
   onCreate: (status: TaskStatus) => void;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
-  onComplete: (task: Task) => void;
+  onComplete: (task: Task) => Promise<void>;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -99,7 +55,6 @@ export function BoardColumn({
   status,
   tasks,
   presentations,
-  now,
   emptyMessage,
   isDropTarget,
   draggedTaskId,
@@ -128,27 +83,8 @@ export function BoardColumn({
   const { language, text } = useTaskboardI18n();
   const details = STATUS_DETAILS[status];
   const label = taskStatusLabel(language, status);
-  const [dropBeforeTaskId, setDropBeforeTaskId] = useState<string | null | undefined>();
-  const taskIndexes = new Map(tasks.map((task, index) => [task.id, index]));
-  const remainingTasks = tasks.filter((task) => task.id !== draggedTaskId);
-  const remainingIndexes = new Map(remainingTasks.map((task, index) => [task.id, index]));
-  const draggedTaskIndex = draggedTaskId ? taskIndexes.get(draggedTaskId) ?? -1 : -1;
-  const beforeIndex = dropBeforeTaskId
-    ? remainingIndexes.get(dropBeforeTaskId) ?? remainingTasks.length
-    : remainingTasks.length;
-  const previewIndex = isDropTarget && dropBeforeTaskId !== undefined ? beforeIndex : -1;
-  const dragDistance = draggedTaskHeight + 8;
-
-  useEffect(() => {
-    if (!isDropTarget || !draggedTaskId) setDropBeforeTaskId(undefined);
-  }, [draggedTaskId, isDropTarget]);
-
-  function findDropBefore(container: HTMLElement, clientY: number): string | null {
-    const cards = Array.from(container.querySelectorAll<HTMLElement>("[data-task-id]"))
-      .filter((card) => card.dataset.taskId !== draggedTaskId);
-    return cards.find((card) => clientY < card.getBoundingClientRect().top + card.offsetHeight / 2)
-      ?.dataset.taskId ?? null;
-  }
+  const { findDropBefore, clearDropPreview, updateDropPreview, leaveDropPreview, getTaskDragShift } =
+    useTaskCardDragPreview({ tasks, draggedTaskId, draggedTaskHeight, isDropTarget });
 
   function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
@@ -156,18 +92,7 @@ export function BoardColumn({
       event.dataTransfer.getData("application/x-taskboard-task") ||
       event.dataTransfer.getData("text/plain");
     if (taskId) onDrop(status, taskId, findDropBefore(event.currentTarget, event.clientY));
-    setDropBeforeTaskId(undefined);
-  }
-
-  function getTaskDragShift(task: Task): number {
-    if (!draggedTaskId || task.id === draggedTaskId) return 0;
-    let shift = 0;
-    const taskIndex = taskIndexes.get(task.id) ?? -1;
-    const remainingIndex = remainingIndexes.get(task.id) ?? -1;
-
-    if (draggedTaskIndex >= 0 && taskIndex > draggedTaskIndex) shift -= dragDistance;
-    if (previewIndex >= 0 && remainingIndex >= previewIndex) shift += dragDistance;
-    return shift;
+    clearDropPreview();
   }
 
   return (
@@ -176,27 +101,19 @@ export function BoardColumn({
       aria-labelledby={`column-${status}`}
       onDragEnter={() => onDragEnter(status)}
       onDragOver={(event) => {
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
         onDragEnter(status);
-        setDropBeforeTaskId(findDropBefore(event.currentTarget, event.clientY));
+        updateDropPreview(event);
       }}
-      onDragLeave={(event) => {
-        if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) {
-          setDropBeforeTaskId(undefined);
-        }
-      }}
+      onDragLeave={leaveDropPreview}
       onDrop={handleDrop}
     >
       <header className="column-header">
         <div className="column-heading">
           <span className={`column-status-icon status-icon-${details.tone}`}>
-            <ColumnStatusIcon status={status} />
+            <StatusIcon status={status} color="var(--column-status-color)" size={14} />
           </span>
           <h2 id={`column-${status}`}>
-            {label}{tasks.length > 0 && (
-              status === "todo" || status === "in_progress" || status === "in_review"
-            ) ? ` ${tasks.length}` : ""}
+            {label}{tasks.length > 0 ? ` ${tasks.length}` : ""}
           </h2>
         </div>
         {createEnabled && (
@@ -208,7 +125,7 @@ export function BoardColumn({
               aria-label={text(`在${label}中新建议题`, `Create issue in ${label}`)}
               title={text(`添加到${label}`, `Add to ${label}`)}
             >
-              <TaskboardIcon name={COLUMN_ADD_ICONS[status] ?? "columnAdd"} />
+              <PlusIcon color="var(--column-status-color)" size={12} />
             </button>
           </div>
         )}
@@ -216,13 +133,12 @@ export function BoardColumn({
 
       <div className="column-list" ref={scrollRef}>
         {tasks.map((task) => {
-          const dragShift = getTaskDragShift(task);
+          const dragShift = getTaskDragShift(task.id);
           return (
             <TaskCard
               key={task.id}
               task={task}
               presentation={presentations[task.id]}
-              now={now}
               isDragging={draggedTaskId === task.id}
               dragShift={dragShift}
               isMoving={movingTaskId === task.id}

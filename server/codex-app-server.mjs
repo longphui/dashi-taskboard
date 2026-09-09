@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { executableCommand } from "../shared/executable-command.mjs";
@@ -26,8 +27,7 @@ export class CodexAppServer {
     this.nextRequestId = 1;
     this.pending = new Map();
     this.listeners = new Set();
-    this.stdoutBuffer = "";
-    this.stderr = "";
+    this.terminatedChildren = new WeakSet();
   }
 
   subscribe(listener) {
@@ -64,20 +64,20 @@ export class CodexAppServer {
   }
 
   async request(method, params) {
-    await this.#ensureStarted();
-    return this.#sendRequest(method, params);
+    const child = await this.#ensureStarted();
+    return this.#sendRequest(child, method, params);
   }
 
   async close() {
     this.closing = true;
     const child = this.child;
-    this.child = null;
     this.starting = null;
-    this.#rejectPending(new CodexAppServerError("Codex app-server closed"));
+    const error = new CodexAppServerError("Codex app-server closed");
+    if (child) this.#handleExit(child, error);
+    this.#rejectPending(error);
     this.listeners.clear();
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
     child.stdin.end();
-    child.kill("SIGTERM");
     await Promise.race([
       new Promise((resolve) => child.once("exit", resolve)),
       new Promise((resolve) => {
@@ -89,40 +89,41 @@ export class CodexAppServer {
   }
 
   async #ensureStarted() {
-    if (this.child && this.child.exitCode === null && this.child.signalCode === null) return;
-    if (this.starting) return this.starting;
     if (this.closing) throw new CodexAppServerError("Codex app-server is closing");
+    if (this.starting) return this.starting;
+    if (this.child && this.child.exitCode === null && this.child.signalCode === null) return this.child;
 
-    this.starting = new Promise((resolve, reject) => {
+    const starting = new Promise((resolve, reject) => {
       const command = executableCommand(this.executable, ["app-server", "--stdio"]);
       const child = spawn(command.executable, command.args, {
         env: this.processEnv,
         stdio: ["pipe", "pipe", "pipe"],
       });
       this.child = child;
-      this.stdoutBuffer = "";
-      this.stderr = "";
+      const output = { stdoutBuffer: "", stderr: "" };
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => this.#handleStdout(chunk));
+      child.stdout.on("data", (chunk) => this.#handleStdout(child, output, chunk));
       child.stderr.on("data", (chunk) => {
-        this.stderr = `${this.stderr}${chunk}`.slice(-STDERR_LIMIT);
+        output.stderr = `${output.stderr}${chunk}`.slice(-STDERR_LIMIT);
       });
-      child.stdin.on("error", (error) => this.#handleExit(error));
+      child.stdin.on("error", (error) => this.#handleExit(child, error));
+      child.stdout.on("error", (error) => this.#handleExit(child, error));
+      child.stderr.on("error", (error) => this.#handleExit(child, error));
       child.once("error", (error) => {
-        this.#handleExit(error);
+        this.#handleExit(child, error);
         reject(error);
       });
       child.once("exit", (code, signal) => {
-        const suffix = this.stderr.trim() ? `: ${this.stderr.trim()}` : "";
+        const suffix = output.stderr.trim() ? `: ${output.stderr.trim()}` : "";
         const error = new CodexAppServerError(
           `Codex app-server exited (${signal || code})${suffix}`,
           { code, signal },
         );
-        this.#handleExit(error);
+        this.#handleExit(child, error);
       });
       child.once("spawn", () => {
-        this.#sendRequest("initialize", {
+        this.#sendRequest(child, "initialize", {
           clientInfo: {
             name: "codex-taskboard",
             title: "Codex Taskboard",
@@ -133,19 +134,19 @@ export class CodexAppServer {
             requestAttestation: false,
           },
         }).then(() => {
-          this.#sendNotification("initialized");
-          resolve();
+          this.#sendNotification(child, "initialized");
+          resolve(child);
         }, reject);
       });
     }).finally(() => {
-      this.starting = null;
+      if (this.starting === starting) this.starting = null;
     });
-    return this.starting;
+    this.starting = starting;
+    return starting;
   }
 
-  #sendRequest(method, params) {
-    const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
+  #sendRequest(child, method, params) {
+    if (!child || child !== this.child || child.exitCode !== null || child.signalCode !== null) {
       return Promise.reject(new CodexAppServerError("Codex app-server is not running"));
     }
     const id = this.nextRequestId;
@@ -156,46 +157,45 @@ export class CodexAppServer {
         reject(new CodexAppServerError(`Codex app-server request '${method}' timed out`));
       }, this.requestTimeoutMs);
       timer.unref();
-      this.pending.set(id, { method, resolve, reject, timer });
+      this.pending.set(id, { child, method, resolve, reject, timer });
       child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, (error) => {
-        if (!error) return;
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(error);
+        if (error) this.#handleExit(child, error);
       });
     });
   }
 
-  #sendNotification(method) {
-    this.child?.stdin.write(`${JSON.stringify({ method })}\n`);
+  #sendNotification(child, method) {
+    child.stdin.write(`${JSON.stringify({ method })}\n`, (error) => {
+      if (error) this.#handleExit(child, error);
+    });
   }
 
-  #handleStdout(chunk) {
-    this.stdoutBuffer += chunk;
-    if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
-      this.child?.kill("SIGTERM");
-      this.#handleExit(new CodexAppServerError("Codex app-server output exceeded its limit"));
+  #handleStdout(child, output, chunk) {
+    if (child !== this.child) return;
+    output.stdoutBuffer += chunk;
+    if (output.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
+      this.#handleExit(child, new CodexAppServerError("Codex app-server output exceeded its limit"));
       return;
     }
-    let newlineIndex = this.stdoutBuffer.indexOf("\n");
-    while (newlineIndex >= 0) {
-      const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+    let newlineIndex = output.stdoutBuffer.indexOf("\n");
+    while (newlineIndex >= 0 && child === this.child) {
+      const line = output.stdoutBuffer.slice(0, newlineIndex).trim();
+      output.stdoutBuffer = output.stdoutBuffer.slice(newlineIndex + 1);
       if (line) {
         try {
-          this.#handleMessage(JSON.parse(line));
+          this.#handleMessage(child, JSON.parse(line));
         } catch (error) {
           console.error("Codex app-server returned invalid JSON", error);
         }
       }
-      newlineIndex = this.stdoutBuffer.indexOf("\n");
+      newlineIndex = output.stdoutBuffer.indexOf("\n");
     }
   }
 
-  #handleMessage(message) {
+  #handleMessage(child, message) {
     if (message && Object.hasOwn(message, "id") && !message.method) {
       const pending = this.pending.get(message.id);
-      if (!pending) return;
+      if (!pending || pending.child !== child) return;
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error) {
@@ -210,24 +210,160 @@ export class CodexAppServer {
     }
     if (typeof message?.method !== "string") return;
     if (Object.hasOwn(message, "id")) {
-      this.child?.stdin.write(`${JSON.stringify({
+      child.stdin.write(`${JSON.stringify({
         id: message.id,
         error: { code: -32601, message: `Unsupported server request '${message.method}'` },
-      })}\n`);
+      })}\n`, (error) => {
+        if (error) this.#handleExit(child, error);
+      });
       return;
     }
+    this.#notify(message, child);
+  }
+
+  #notify(message, child) {
     for (const listener of this.listeners) {
       try {
-        listener(message);
+        listener(message, child);
       } catch (error) {
         console.error("Codex app-server notification handler failed", error);
       }
     }
   }
 
-  #handleExit(error) {
-    if (this.child && this.child.exitCode !== null) this.child = null;
-    this.#rejectPending(error);
+  #handleExit(child, error) {
+    if (this.terminatedChildren.has(child)) return;
+    this.terminatedChildren.add(child);
+    if (this.child === child) {
+      this.child = null;
+      this.starting = null;
+    }
+    this.#rejectPending(error, child);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    this.#notify({
+      method: "app-server/terminated",
+      params: { message: error.message },
+    }, child);
+  }
+
+  #rejectPending(error, child) {
+    for (const [id, pending] of this.pending) {
+      if (child && pending.child !== child) continue;
+      this.pending.delete(id);
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+  }
+}
+
+export class CodexHostAppServer {
+  constructor({ hostId, ipc = process, requestTimeoutMs } = {}) {
+    this.hostId = hostId;
+    this.ipc = ipc;
+    this.requestTimeoutMs = requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.pending = new Map();
+    this.listeners = new Set();
+    this.closed = false;
+    this.handleMessage = (message) => this.#handleMessage(message);
+    this.ipc.on?.("message", this.handleMessage);
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async listSkills(workspacePath, { forceReload = false } = {}) {
+    const result = await this.request("skills/list", {
+      cwds: [workspacePath],
+      forceReload,
+    });
+    return Array.isArray(result?.data) ? result.data : [];
+  }
+
+  startThread(params) {
+    return this.request("thread/start", params);
+  }
+
+  resumeThread(params) {
+    return this.request("thread/resume", params);
+  }
+
+  startTurn(params) {
+    return this.request("turn/start", params);
+  }
+
+  interruptTurn(params) {
+    return this.request("turn/interrupt", params);
+  }
+
+  compactThread(threadId) {
+    return this.request("thread/compact/start", { threadId });
+  }
+
+  request(method, params) {
+    if (this.closed || typeof this.ipc.send !== "function" || this.ipc.connected === false) {
+      return Promise.reject(new CodexAppServerError("Codex host bridge is unavailable"));
+    }
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(requestId);
+        reject(new CodexAppServerError(`Codex host request '${method}' timed out`));
+      }, this.requestTimeoutMs);
+      timer.unref();
+      this.pending.set(requestId, { method, resolve, reject, timer });
+      this.ipc.send({
+        type: "taskboard:codex-app-server-request",
+        requestId,
+        hostId: this.hostId,
+        method,
+        params,
+      }, (error) => {
+        if (!error) return;
+        clearTimeout(timer);
+        this.pending.delete(requestId);
+        reject(error);
+      });
+    });
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.ipc.off?.("message", this.handleMessage);
+    this.#rejectPending(new CodexAppServerError("Codex host bridge closed"));
+    this.listeners.clear();
+  }
+
+  #handleMessage(message) {
+    if (!message || typeof message !== "object" || message.hostId !== this.hostId) return;
+    if (message.type === "taskboard:codex-app-server-response") {
+      const pending = this.pending.get(message.requestId);
+      if (!pending) return;
+      this.pending.delete(message.requestId);
+      clearTimeout(pending.timer);
+      if (message.error) {
+        pending.reject(new CodexAppServerError(
+          `Codex host rejected '${pending.method}': ${message.error}`,
+        ));
+      } else {
+        pending.resolve(message.result);
+      }
+      return;
+    }
+    if (
+      message.type !== "taskboard:codex-app-server-notification"
+      || typeof message.method !== "string"
+    ) return;
+    const notification = { method: message.method, params: message.params };
+    for (const listener of this.listeners) {
+      try {
+        listener(notification);
+      } catch (error) {
+        console.error("Codex host notification handler failed", error);
+      }
+    }
   }
 
   #rejectPending(error) {

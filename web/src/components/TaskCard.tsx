@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import { attachmentContentUrl, resolvePersistedAttachmentUrl } from "../api";
+import { resolvePersistedAttachmentUrl } from "../api";
 import {
   TASK_PRIORITIES,
   type ActorIdentity,
@@ -19,11 +19,11 @@ import type {
   TaskConversationItem,
 } from "../taskConversations";
 import { ActorAvatar } from "./ActorAvatar";
-import { LinearIcon, LinearPriorityIcon } from "./LinearIcon";
+import { LinearIcon } from "./LinearIcon";
+import { DueDateIcon, PriorityIcon, ProjectIcon } from "./SemanticIcons";
 import { LabelPicker } from "./LabelPicker";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
-import { TaskboardIcon } from "./TaskboardIcon";
 import completeIcon from "../assets/figma-taskboard/card-complete.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
 
@@ -31,7 +31,6 @@ interface TaskCardProps {
   task: Task;
   variant?: "main" | "sidebar";
   presentation: TaskCardPresentation;
-  now: number;
   isDragging: boolean;
   dragShift: number;
   isMoving: boolean;
@@ -45,7 +44,7 @@ interface TaskCardProps {
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
-  onComplete?: (task: Task) => void;
+  onComplete?: (task: Task) => Promise<void>;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -109,8 +108,7 @@ function firstTaskImage(task: Task) {
     /!\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+["'][^)]*["'])?\)/,
   );
   const source = markdownImage?.[1]
-    ?? markdownImage?.[2]
-    ?? (task.previewImage ? attachmentContentUrl(task.previewImage) : null);
+    ?? markdownImage?.[2];
   return source ? resolvePersistedAttachmentUrl(source) : null;
 }
 
@@ -196,26 +194,38 @@ function ProcessingProgress({
   );
 }
 
+function ProcessingLabel({ processing }: { processing: TaskCardPresentation["processing"] }) {
+  const { text } = useTaskboardI18n();
+  const { running, startedAt } = processing;
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!running || !startedAt) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [running, startedAt]);
+  const elapsed = elapsedTime(startedAt, now);
+  return (
+    <span className="task-processing-label">
+      {running
+        ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
+        : text("暂停处理", "Processing paused")}
+    </span>
+  );
+}
+
 function ProcessingStatusRow({
   presentation,
-  now,
   onOpenConversation,
 }: {
   presentation: TaskCardPresentation;
-  now: number;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }) {
-  const { text } = useTaskboardI18n();
-  const elapsed = elapsedTime(presentation.processing.startedAt, now);
   const running = presentation.processing.running;
   return (
     <div className={`task-processing-row${running ? " is-running" : " is-paused"}`}>
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
-      <span className="task-processing-label">
-        {running
-          ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
-          : text("暂停处理", "Processing paused")}
-      </span>
+      <ProcessingLabel processing={presentation.processing} />
       <span className="task-processing-spacer" aria-hidden="true" />
       {presentation.conversations.length > 0 && (
         <TaskConversationMenu
@@ -312,7 +322,7 @@ function PriorityControl({
       options={TASK_PRIORITIES.map((priority) => ({
         value: priority,
         label: taskPriorityLabel(language, priority),
-        icon: <LinearPriorityIcon priority={priority} />,
+        icon: <PriorityIcon priority={priority} size={14} />,
         className: `priority-${priority}`,
       }))}
       open={open}
@@ -344,7 +354,7 @@ function DueDateControl({
   if (!task.dueDate) return null;
   return (
     <label className="due-date-chip card-property-control" title={text(`截止日期 ${task.dueDate}`, `Due date ${task.dueDate}`)}>
-      <TaskboardIcon name="calendar" /> {calendarDate(task.dueDate, locale)}
+      <DueDateIcon color="currentColor" size={12} /> {calendarDate(task.dueDate, locale)}
       <input
         type="date"
         aria-label={text(`${displayIdentifier} 截止日期`, `${displayIdentifier} due date`)}
@@ -358,7 +368,7 @@ function DueDateControl({
 
 function AssigneeControl({
   task,
-  participants,
+  participants: persistedParticipants,
   currentUser,
   disabled,
   open,
@@ -375,7 +385,12 @@ function AssigneeControl({
 }) {
   const { text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
-  const options = [task.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const currentUserKey = actorKey(currentUser);
+  const assignee = actorKey(task.assignee) === currentUserKey ? currentUser : task.assignee;
+  const participants = persistedParticipants.map((participant) => (
+    actorKey(participant) === currentUserKey ? currentUser : participant
+  ));
+  const options = [assignee, currentUser, CODEX_AGENT_ACTOR]
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
@@ -384,7 +399,7 @@ function AssigneeControl({
       value={actorKey(task.assignee)}
       options={options.map((actor) => ({
         value: actorKey(actor),
-        label: actor.id === currentUser.id ? text(`${actor.name}（我）`, `${actor.name} (me)`) : actor.name,
+        label: actorKey(actor) === currentUserKey ? text(`${actor.name}（我）`, `${actor.name} (me)`) : actor.name,
         icon: <ActorAvatar actor={actor} className="task-property-assignee-avatar" />,
       }))}
       open={open}
@@ -393,7 +408,7 @@ function AssigneeControl({
       triggerClassName="task-assignee-trigger"
       triggerContent={<ParticipantAvatars participants={participants} />}
       ariaLabel={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
-      title={text(`负责人：${task.assignee.name}`, `Assignee: ${task.assignee.name}`)}
+      title={text(`负责人：${assignee.name}`, `Assignee: ${assignee.name}`)}
       onOpenChange={onOpenChange}
       onChange={(value) => {
         const selected = options.find((actor) => actorKey(actor) === value);
@@ -408,7 +423,6 @@ export function TaskCard({
   task,
   variant = "main",
   presentation,
-  now,
   isDragging,
   dragShift,
   isMoving,
@@ -467,7 +481,10 @@ export function TaskCard({
   return (
     <article
       className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
-      style={dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : undefined}
+      style={{
+        viewTransitionName: task.status === "in_review" ? `review-task-${task.id}` : "none",
+        ...(dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : {}),
+      }}
       draggable={!isMoving}
       aria-labelledby={`task-${task.id}-title`}
       data-task-id={task.id}
@@ -505,7 +522,13 @@ export function TaskCard({
             title={text("完成", "Complete")}
             onClick={(event) => {
               event.stopPropagation();
-              onComplete(task);
+              const card = event.currentTarget.closest<HTMLElement>(".task-card")!;
+              card.style.viewTransitionName = "completing-task";
+              const transition = document.startViewTransition(() => onComplete(task));
+              void transition.finished.then(
+                () => { card.style.viewTransitionName = `review-task-${task.id}`; },
+                () => { card.style.viewTransitionName = `review-task-${task.id}`; },
+              );
             }}
           >
             <img src={completeIcon} alt="" aria-hidden="true" />
@@ -530,11 +553,11 @@ export function TaskCard({
 
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
 
+      {body && <p className="task-card-description">{body}</p>}
+
       {(task.status === "todo" || task.status === "in_progress") && task.resumeRequest && (
         <TaskResumeStatus task={task} />
       )}
-
-      {body && <p className="task-card-description">{body}</p>}
 
       {image && (
         <TaskCardMedia key={image} src={image} />
@@ -544,7 +567,7 @@ export function TaskCard({
         <div className="card-properties" aria-label={text("议题属性", "Issue properties")}>
           {projectName && (
             <span className="project-chip" title={projectName}>
-              <LinearIcon name="project" />
+              <ProjectIcon color="currentColor" />
               <span>{projectName}</span>
             </span>
           )}
@@ -607,7 +630,6 @@ export function TaskCard({
           <ProcessingProgress presentation={presentation} />
           <ProcessingStatusRow
             presentation={presentation}
-            now={now}
             onOpenConversation={onOpenConversation}
           />
         </>

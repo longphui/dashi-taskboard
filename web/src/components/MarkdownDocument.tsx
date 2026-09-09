@@ -1,6 +1,8 @@
 import {
   Children,
+  createContext,
   isValidElement,
+  useContext,
   useEffect,
   useId,
   useState,
@@ -12,7 +14,7 @@ import {
 } from "react";
 import { JSON_SCHEMA, load as loadYaml } from "js-yaml";
 import type { UponSanitizeAttributeHook, UponSanitizeElementHook } from "dompurify";
-import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from "react-markdown";
 import { decodeString } from "micromark-util-decode-string";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -23,6 +25,10 @@ interface MarkdownAstNode {
   type: string;
   value?: string;
   children?: MarkdownAstNode[];
+  data?: {
+    hName?: string;
+    hProperties?: Record<string, unknown>;
+  };
   position?: {
     start: { offset?: number };
     end: { offset?: number };
@@ -329,6 +335,36 @@ export function remarkStripMarkdownComments() {
       return true;
     };
     visit(tree, true);
+    const children = tree.children;
+    if (!children || children.length < 2) return;
+    const nextChildren: MarkdownAstNode[] = [];
+
+    children.forEach((child, index) => {
+      const previous = children[index - 1];
+      const previousEnd = previous?.position?.end.offset;
+      const childStart = child.position?.start.offset;
+      if (previousEnd !== undefined && childStart !== undefined) {
+        const gap = source.slice(previousEnd, childStart);
+        if (/^[\t \r\n]*$/.test(gap)) {
+          const extraBlankLines = Math.max(0, (gap.match(/\r\n|\r|\n/g)?.length ?? 0) - 2);
+          for (let blankLine = 0; blankLine < extraBlankLines; blankLine += 1) {
+            nextChildren.push({
+              type: "paragraph",
+              children: [],
+              data: {
+                hName: "div",
+                hProperties: {
+                  className: ["markdown-blank-line"],
+                  "aria-hidden": "true",
+                },
+              },
+            });
+          }
+        }
+      }
+      nextChildren.push(child);
+    });
+    tree.children = nextChildren;
   };
 }
 
@@ -468,70 +504,100 @@ function MarkdownPre({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
   return <pre {...props}>{children}</pre>;
 }
 
+interface MarkdownDocumentContextValue {
+  value: string;
+  onImageClick?: (event: MouseEvent<HTMLImageElement>) => void;
+  onLinkClick?: (event: MouseEvent<HTMLAnchorElement>, href?: string) => void;
+  renderLink?: (href: string | undefined, children: ReactNode) => ReactNode | null;
+}
+
+const MarkdownDocumentContext = createContext<MarkdownDocumentContextValue | null>(null);
+
+function MarkdownLink({
+  node,
+  href,
+  children,
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"a"> & ExtraProps) {
+  const { value, onLinkClick, renderLink } = useContext(MarkdownDocumentContext)!;
+  const renderedLink = renderLink?.(href, children);
+  const isRenderedLink = renderedLink !== null && renderedLink !== undefined;
+  const start = node?.position?.start.offset;
+  const end = node?.position?.end.offset;
+  const markdown = typeof start === "number" && typeof end === "number"
+    ? value.slice(start, end)
+    : undefined;
+  const isComposerReference = Boolean(
+    markdown && /^\[[\s\S]*\]\(taskboard:\/\/composer-reference\/[^)]+\)$/.test(markdown),
+  );
+  if (isValidElement(renderedLink) && renderedLink.type === "video") {
+    return renderedLink;
+  }
+  return (
+    <a
+      {...props}
+      className={[className, isRenderedLink ? "issue-reference-link" : ""].filter(Boolean).join(" ") || undefined}
+      data-taskboard-inline-media-markdown={isRenderedLink || isComposerReference ? markdown : undefined}
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(event) => onLinkClick?.(event, href)}
+    >
+      {isRenderedLink ? renderedLink : children}
+    </a>
+  );
+}
+
+function MarkdownImage({ node, ...props }: ComponentPropsWithoutRef<"img"> & ExtraProps) {
+  const { value, onImageClick } = useContext(MarkdownDocumentContext)!;
+  const start = node?.position?.start.offset;
+  const end = node?.position?.end.offset;
+  const markdown = typeof start === "number" && typeof end === "number"
+    ? value.slice(start, end)
+    : undefined;
+  const selfContainedMarkdown = markdown
+    && /^!\[(?:\\.|[^\]])*\]\(/.test(markdown)
+    ? markdown
+    : undefined;
+  return (
+    <img
+      {...props}
+      className={[props.className, onImageClick ? "is-previewable" : ""].filter(Boolean).join(" ") || undefined}
+      data-taskboard-inline-media-markdown={selfContainedMarkdown}
+      onClick={onImageClick}
+    />
+  );
+}
+
 export function MarkdownDocument({
   value,
   onCopy,
+  onImageClick,
   onLinkClick,
   renderLink,
 }: {
   value: string;
   onCopy?: ClipboardEventHandler<HTMLDivElement>;
+  onImageClick?: (event: MouseEvent<HTMLImageElement>) => void;
   onLinkClick?: (event: MouseEvent<HTMLAnchorElement>, href?: string) => void;
   renderLink?: (href: string | undefined, children: ReactNode) => ReactNode | null;
 }) {
   return (
     <div className="issue-description-document" onCopy={onCopy}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkStripMarkdownComments, remarkBreaks]}
-        urlTransform={(url) => defaultUrlTransform(resolvePersistedAttachmentUrl(url))}
-        components={{
-          a: ({ node, href, children, className, ...props }) => {
-            const renderedLink = renderLink?.(href, children);
-            const isRenderedLink = renderedLink !== null && renderedLink !== undefined;
-            const start = node?.position?.start.offset;
-            const end = node?.position?.end.offset;
-            const markdown = typeof start === "number" && typeof end === "number"
-              ? value.slice(start, end)
-              : undefined;
-            const isComposerReference = Boolean(
-              markdown && /^\[[\s\S]*\]\(taskboard:\/\/composer-reference\/[^)]+\)$/.test(markdown),
-            );
-            return (
-              <a
-                {...props}
-                className={[className, isRenderedLink ? "issue-reference-link" : ""].filter(Boolean).join(" ") || undefined}
-                data-taskboard-inline-media-markdown={isRenderedLink || isComposerReference ? markdown : undefined}
-                href={href}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(event) => onLinkClick?.(event, href)}
-              >
-                {isRenderedLink ? renderedLink : children}
-              </a>
-            );
-          },
-          img: ({ node, ...props }) => {
-            const start = node?.position?.start.offset;
-            const end = node?.position?.end.offset;
-            const markdown = typeof start === "number" && typeof end === "number"
-              ? value.slice(start, end)
-              : undefined;
-            const selfContainedMarkdown = markdown
-              && /^!\[(?:\\.|[^\]])*\]\(/.test(markdown)
-              ? markdown
-              : undefined;
-            return (
-              <img
-                {...props}
-                data-taskboard-inline-media-markdown={selfContainedMarkdown}
-              />
-            );
-          },
-          pre: MarkdownPre,
-        }}
-      >
-        {value}
-      </ReactMarkdown>
+      <MarkdownDocumentContext.Provider value={{ value, onImageClick, onLinkClick, renderLink }}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkStripMarkdownComments, remarkBreaks]}
+          urlTransform={(url) => defaultUrlTransform(resolvePersistedAttachmentUrl(url))}
+          components={{
+            a: MarkdownLink,
+            img: MarkdownImage,
+            pre: MarkdownPre,
+          }}
+        >
+          {value}
+        </ReactMarkdown>
+      </MarkdownDocumentContext.Provider>
     </div>
   );
 }

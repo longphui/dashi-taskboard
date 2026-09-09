@@ -1,10 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use base64::Engine;
 #[cfg(target_os = "macos")]
 use dispatch2::{run_on_main, MainThreadBound};
-use futures_util::StreamExt;
-use minisign_verify::{PublicKey, Signature};
+use futures_util::{future::{BoxFuture, Shared}, FutureExt};
 #[cfg(target_os = "macos")]
 use objc2::{
     define_class, msg_send,
@@ -15,18 +13,18 @@ use objc2::{
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSAlert, NSApplication, NSButton, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSRunningApplication,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSObject, NSSize, NSString};
-use reqwest::header::{HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::{
     fs::{self, File, OpenOptions},
-    future::{poll_fn, Future},
     io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -35,12 +33,14 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    task::Poll,
     thread,
     time::{Duration, Instant},
 };
 #[cfg(target_os = "windows")]
-use std::{os::windows::fs::OpenOptionsExt, process::ChildStdin};
+use std::{
+    os::windows::{fs::OpenOptionsExt, process::CommandExt},
+    process::ChildStdin,
+};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 use tauri::{
@@ -52,13 +52,62 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use uuid::Uuid;
+#[cfg(target_os = "windows")]
+use windows::{
+    core::PWSTR,
+    Win32::{
+        Foundation::{CloseHandle, ERROR_SUCCESS, FILETIME, WAIT_OBJECT_0},
+        System::{
+            RestartManager::{
+                RmEndSession, RmRegisterResources, RmShutdown, RmStartSession, CCH_RM_SESSION_KEY,
+                RM_UNIQUE_PROCESS,
+            },
+            Threading::{
+                GetProcessTimes, OpenProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            },
+        },
+    },
+};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 const LAUNCHER_STOP_TIMEOUT: Duration = Duration::from_secs(36);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
-#[cfg(target_os = "macos")]
+const BETA_UPDATER_ENDPOINT: &str =
+    "https://raw.githubusercontent.com/chuspeeism/dashi-taskboard/beta-updater/latest.json";
+// Unique whole-directory snapshots shipped from app-v0.2.0 through v1.1.2.
+const KNOWN_TASKBOARD_SKILL_DIGESTS: [&str; 6] = [
+    "eeaaa5d71a2c47688bf62a5eb9f45e9138fe49eb636a46cfd6af8a0f8853e2e0",
+    "c4ce3257bbf3efed1bb4d2d9f26436be8ba835d4ab4adf6fed38f5abbedafa59",
+    "6f1b1bb3a731aa154018c97b0779442f6c461cb5dd3ea91ca49da4bb3b8a8ea0",
+    "8ab19649d29cad0a39b0ab202b909bf03de07e37837b05cd5c3df5a4da0119f8",
+    "27131c82ac63c2884c1fcb7dd22a4e1c75975c7d79eb3fa3483a7949dd5f284d",
+    "ae74aec793decf6d9013c36f4b53e01723796a45567b77e9e9f22b4a168d3fbe",
+];
+const TASKBOARD_PREFERRED_PORT: u16 = 47823;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const TASKBOARD_LISTEN_FD: i32 = 5;
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_MIGRATION_SOURCE_ENV: &str =
+    "CODEX_TASKBOARD_MACOS_BUNDLE_MIGRATION_SOURCE";
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_MIGRATION_BETA_AUTOSTART_ENV: &str =
+    "CODEX_TASKBOARD_MACOS_BUNDLE_MIGRATION_BETA_AUTOSTART";
+
+fn release_version() -> &'static str {
+    option_env!("CODEX_TASKBOARD_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+fn is_beta_release() -> bool {
+    release_version().contains("-beta.")
+}
+
+#[cfg(target_os = "macos")]
+struct MacosBundleMigration {
+    source_executable: PathBuf,
+    beta_autostart_was_enabled: bool,
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +136,17 @@ struct LauncherRuntimeDescriptor {
     url: String,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "launcherEvent", rename_all = "camelCase")]
+enum LauncherEvent {
+    WaitingForCodex,
+    ServiceReady,
+    OpenSignalReady,
+    OpenSignalQueued,
+    OpenedInExistingCodex,
+    Injected,
+}
+
 struct LauncherState {
     child: Mutex<Option<u32>>,
     snapshot: Mutex<LauncherSnapshot>,
@@ -94,11 +154,12 @@ struct LauncherState {
     intentional_stop: AtomicBool,
     update_flow_in_progress: AtomicBool,
     update_in_progress: AtomicBool,
+    pending_update: tauri::async_runtime::Mutex<Option<PendingUpdate>>,
     generation: AtomicU64,
     lifecycle: Mutex<()>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     taskboard_listener: Mutex<Option<TcpListener>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     codex_port: Mutex<Option<u16>>,
     #[cfg(target_os = "windows")]
     child_control: Mutex<Option<ChildStdin>>,
@@ -108,10 +169,16 @@ struct LauncherState {
     pid_record_path: PathBuf,
 }
 
+#[derive(Clone)]
+struct PendingUpdate {
+    update: Update,
+    download: Shared<BoxFuture<'static, Result<Arc<Vec<u8>>, String>>>,
+    dialog: Arc<Mutex<Option<UpdateDialog>>>,
+}
+
 #[cfg(target_os = "macos")]
 struct UpdateDialogTargetIvars {
     response: RefCell<Option<std::sync::mpsc::Sender<bool>>>,
-    cancel: RefCell<Option<(tauri::async_runtime::Sender<()>, Arc<AtomicBool>)>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -134,14 +201,6 @@ define_class!(
         fn defer_update(&self, _sender: &AnyObject) {
             self.respond(false);
         }
-
-        #[unsafe(method(cancelUpdate:))]
-        fn cancel_update(&self, _sender: &AnyObject) {
-            if let Some((cancel, cancel_requested)) = self.ivars().cancel.borrow_mut().take() {
-                cancel_requested.store(true, Ordering::SeqCst);
-                let _ = cancel.try_send(());
-            }
-        }
     }
 );
 
@@ -150,7 +209,6 @@ impl UpdateDialogTarget {
     fn new(mtm: MainThreadMarker, response: std::sync::mpsc::Sender<bool>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(UpdateDialogTargetIvars {
             response: RefCell::new(Some(response)),
-            cancel: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -160,18 +218,6 @@ impl UpdateDialogTarget {
             let _ = response.send(accepted);
         }
     }
-
-    fn set_cancel(
-        &self,
-        cancel: tauri::async_runtime::Sender<()>,
-        cancel_requested: Arc<AtomicBool>,
-    ) {
-        *self.ivars().cancel.borrow_mut() = Some((cancel, cancel_requested));
-    }
-
-    fn clear_cancel(&self) {
-        self.ivars().cancel.borrow_mut().take();
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -180,7 +226,7 @@ struct NativeUpdateDialog {
     progress_indicator: Retained<NSProgressIndicator>,
     install_button: Retained<NSButton>,
     defer_button: Retained<NSButton>,
-    target: Retained<UpdateDialogTarget>,
+    _target: Retained<UpdateDialogTarget>,
 }
 
 #[cfg(target_os = "macos")]
@@ -191,8 +237,10 @@ struct UpdateDialog {
 
 #[cfg(target_os = "macos")]
 impl UpdateDialog {
-    fn prompt(version: &str) -> Option<Self> {
-        let message = format!("发现 Codex Taskboard {version}。是否现在下载、安装并重启？");
+    fn prompt(_app: &AppHandle, version: &str) -> Option<Self> {
+        let message = format!(
+            "发现新版本 Codex Taskboard {version}。是否现在更新并重启？"
+        );
         let (response, result) = std::sync::mpsc::channel();
         let dialog = run_on_main(move |mtm| {
             let alert = NSAlert::new(mtm);
@@ -226,7 +274,7 @@ impl UpdateDialog {
                         progress_indicator,
                         install_button,
                         defer_button,
-                        target,
+                        _target: target,
                     },
                     mtm,
                 )),
@@ -240,32 +288,22 @@ impl UpdateDialog {
         }
     }
 
-    fn show_progress(
-        &self,
-        message: &str,
-        cancel: tauri::async_runtime::Sender<()>,
-        cancel_requested: Arc<AtomicBool>,
-    ) {
+    fn show_installing(&self, message: &str) {
         let native = Arc::clone(&self.native);
         let message = message.to_owned();
         run_on_main(move |mtm| {
             let native = native.get(mtm);
-            native.target.set_cancel(cancel, cancel_requested);
             native
                 .alert
                 .setInformativeText(&NSString::from_str(&message));
             native.progress_indicator.setIndeterminate(false);
-            native.progress_indicator.setDoubleValue(0.0);
+            native.progress_indicator.setDoubleValue(100.0);
             native
                 .alert
                 .setAccessoryView(Some(&native.progress_indicator));
             native.install_button.setHidden(true);
-            native.defer_button.setTitle(&NSString::from_str("取消"));
-            unsafe {
-                native.defer_button.setAction(Some(sel!(cancelUpdate:)));
-            }
-            native.defer_button.setEnabled(true);
-            native.defer_button.setHidden(false);
+            native.defer_button.setEnabled(false);
+            native.defer_button.setHidden(true);
             native.alert.layout();
             native.progress_indicator.setNeedsDisplay(true);
             native.progress_indicator.displayIfNeeded();
@@ -280,12 +318,20 @@ impl UpdateDialog {
             native
                 .alert
                 .setInformativeText(&NSString::from_str(&message));
-            native.progress_indicator.setIndeterminate(false);
+            native.progress_indicator.setIndeterminate(progress.is_none());
             if let Some(progress) = progress {
+                unsafe {
+                    native.progress_indicator.stopAnimation(None);
+                }
                 native.progress_indicator.setDoubleValue(progress as f64);
+            } else {
+                unsafe {
+                    native.progress_indicator.startAnimation(None);
+                }
             }
+            native.alert.setAccessoryView(Some(&native.progress_indicator));
+            native.install_button.setHidden(true);
             if !cancellable {
-                native.target.clear_cancel();
                 native.defer_button.setEnabled(false);
                 native.defer_button.setHidden(true);
             }
@@ -299,29 +345,50 @@ impl UpdateDialog {
         let native = Arc::clone(&self.native);
         run_on_main(move |mtm| {
             let native = native.get(mtm);
-            native.target.clear_cancel();
             native.alert.window().close();
         });
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct UpdateDialog;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl UpdateDialog {
-    fn prompt(_version: &str) -> Option<Self> {
+    fn prompt(app: &AppHandle, version: &str) -> Option<Self> {
+        app.dialog()
+            .message(format!(
+                "发现新版本 Codex Taskboard {version}。是否现在更新并重启？"
+            ))
+            .title("Codex Taskboard 更新")
+            .kind(MessageDialogKind::Info)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "立即更新".into(),
+                "稍后".into(),
+            ))
+            .blocking_show()
+            .then_some(Self)
+    }
+
+    fn show_installing(&self, _message: &str) {}
+
+    fn set_progress(&self, _message: &str, _progress: Option<u64>, _cancellable: bool) {}
+
+    fn close(&self) {}
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[derive(Clone)]
+struct UpdateDialog;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl UpdateDialog {
+    fn prompt(_app: &AppHandle, _version: &str) -> Option<Self> {
         None
     }
 
-    fn show_progress(
-        &self,
-        _message: &str,
-        _cancel: tauri::async_runtime::Sender<()>,
-        _cancel_requested: Arc<AtomicBool>,
-    ) {
-    }
+    fn show_installing(&self, _message: &str) {}
 
     fn set_progress(&self, _message: &str, _progress: Option<u64>, _cancellable: bool) {}
 
@@ -352,11 +419,12 @@ impl LauncherState {
             intentional_stop: AtomicBool::new(false),
             update_flow_in_progress: AtomicBool::new(false),
             update_in_progress: AtomicBool::new(false),
+            pending_update: tauri::async_runtime::Mutex::new(None),
             generation: AtomicU64::new(0),
             lifecycle: Mutex::new(()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             taskboard_listener: Mutex::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             codex_port: Mutex::new(None),
             #[cfg(target_os = "windows")]
             child_control: Mutex::new(None),
@@ -368,7 +436,7 @@ impl LauncherState {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn acquire_instance_lock(path: &Path) -> Result<Option<File>, std::io::Error> {
     let file = OpenOptions::new()
         .create(true)
@@ -384,6 +452,267 @@ fn acquire_instance_lock(path: &Path) -> Result<Option<File>, std::io::Error> {
             Ok(None)
         } else {
             Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_path_from_executable(executable: &Path) -> Option<PathBuf> {
+    let macos_directory = executable.parent()?;
+    if macos_directory.file_name()? != std::ffi::OsStr::new("MacOS") {
+        return None;
+    }
+    let contents_directory = macos_directory.parent()?;
+    if contents_directory.file_name()? != std::ffi::OsStr::new("Contents") {
+        return None;
+    }
+    let app_path = contents_directory.parent()?;
+    (app_path.extension()? == std::ffi::OsStr::new("app")).then(|| app_path.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_startup_log(line: &str) {
+    let Some(home_directory) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let log_directory = home_directory.join("Library/Logs/Codex Taskboard");
+    if fs::create_dir_all(&log_directory).is_err() {
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_directory.join("codex-taskboard-launcher.log"))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_bundle_migration_lock() -> Result<File, String> {
+    let home_directory = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is unavailable".to_string())?;
+    let data_directory = home_directory.join("Library/Application Support/Codex Taskboard");
+    fs::create_dir_all(&data_directory).map_err(|error| {
+        format!(
+            "无法创建应用数据目录 {}：{error}",
+            data_directory.display()
+        )
+    })?;
+    let lock_path = data_directory.join("launcher.lock");
+    let deadline = Instant::now() + LAUNCHER_STOP_TIMEOUT;
+    loop {
+        match acquire_instance_lock(&lock_path) {
+            Ok(Some(file)) => return Ok(file),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                return Err(format!(
+                    "等待现有 App 退出超时，无法迁移 {}",
+                    lock_path.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "无法锁定 App 迁移路径 {}：{error}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_macos_app_bundle(source: &Path, destination: &Path) -> Result<(), String> {
+    match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "无法将 {} 改名为 {}：{error}",
+                source.display(),
+                destination.display()
+            ));
+        }
+    }
+
+    let script = r#"on run argv
+set sourcePath to item 1 of argv
+set destinationPath to item 2 of argv
+do shell script ("/bin/mv " & quoted form of sourcePath & " " & quoted form of destinationPath) with administrator privileges
+end run"#;
+    let output = StdCommand::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .arg(source)
+        .arg(destination)
+        .output()
+        .map_err(|error| format!("无法请求 App 改名授权：{error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "App 改名授权未完成".into()
+        } else {
+            format!("App 改名授权未完成：{detail}")
+        });
+    }
+    if source.exists() || !destination.is_dir() {
+        return Err(format!(
+            "App 改名后路径状态不正确：{} -> {}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn take_macos_bundle_migration_marker() -> Result<Option<MacosBundleMigration>, String> {
+    let source_executable =
+        std::env::var_os(MACOS_BUNDLE_MIGRATION_SOURCE_ENV).map(PathBuf::from);
+    let beta_autostart_marker =
+        std::env::var_os(MACOS_BUNDLE_MIGRATION_BETA_AUTOSTART_ENV);
+    std::env::remove_var(MACOS_BUNDLE_MIGRATION_SOURCE_ENV);
+    std::env::remove_var(MACOS_BUNDLE_MIGRATION_BETA_AUTOSTART_ENV);
+    let Some(source_executable) = source_executable else {
+        return Ok(None);
+    };
+    let beta_autostart_was_enabled =
+        beta_autostart_marker.as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !is_beta_release() {
+        return Err("稳定版不能恢复 Beta App bundle migration marker".into());
+    }
+
+    let current_executable =
+        std::env::current_exe().map_err(|error| format!("无法定位当前可执行文件：{error}"))?;
+    let current_executable = fs::canonicalize(&current_executable)
+        .map_err(|error| format!("无法解析当前可执行文件路径：{error}"))?;
+    let current_app = macos_app_path_from_executable(&current_executable)
+        .ok_or_else(|| "当前可执行文件不在 macOS App bundle 内".to_string())?;
+    if current_app.file_name() != Some(std::ffi::OsStr::new("Codex Taskboard Beta.app")) {
+        return Err(format!(
+            "macOS App bundle migration marker 只能由改名后的 Beta App 恢复：{}",
+            current_app.display()
+        ));
+    }
+    let relative_executable = current_executable
+        .strip_prefix(&current_app)
+        .map_err(|error| format!("无法解析 Beta App 可执行文件相对路径：{error}"))?;
+    let expected_source_executable = current_app
+        .parent()
+        .ok_or_else(|| format!("无法定位 App 上级目录：{}", current_app.display()))?
+        .join("Codex Taskboard.app")
+        .join(relative_executable);
+    if source_executable != expected_source_executable {
+        return Err(format!(
+            "macOS App bundle migration source marker 不匹配：{} != {}",
+            source_executable.display(),
+            expected_source_executable.display()
+        ));
+    }
+
+    Ok(Some(MacosBundleMigration {
+        source_executable,
+        beta_autostart_was_enabled,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn migrate_macos_beta_app_bundle_name() -> Result<Option<MacosBundleMigration>, String> {
+    if let Some(migration) = take_macos_bundle_migration_marker()? {
+        return Ok(Some(migration));
+    }
+    if !is_beta_release() {
+        return Ok(None);
+    }
+
+    let current_executable =
+        std::env::current_exe().map_err(|error| format!("无法定位当前可执行文件：{error}"))?;
+    let current_executable = fs::canonicalize(&current_executable)
+        .map_err(|error| format!("无法解析当前可执行文件路径：{error}"))?;
+    let Some(current_app) = macos_app_path_from_executable(&current_executable) else {
+        return Ok(None);
+    };
+    if current_app.file_name() == Some(std::ffi::OsStr::new("Codex Taskboard Beta.app")) {
+        return Ok(None);
+    }
+    if current_app.file_name() != Some(std::ffi::OsStr::new("Codex Taskboard.app")) {
+        return Err(format!(
+            "Beta App 当前路径名称不受支持：{}",
+            current_app.display()
+        ));
+    }
+    let destination_app = current_app
+        .parent()
+        .ok_or_else(|| format!("无法定位 App 上级目录：{}", current_app.display()))?
+        .join("Codex Taskboard Beta.app");
+    let executable_name = current_executable
+        .file_name()
+        .ok_or_else(|| format!("无法定位 App 可执行文件名：{}", current_executable.display()))?
+        .to_owned();
+    let destination_executable = destination_app
+        .join("Contents/MacOS")
+        .join(executable_name);
+    let instance_lock = wait_for_macos_bundle_migration_lock()?;
+    let fd_flags = unsafe { libc::fcntl(instance_lock.as_raw_fd(), libc::F_GETFD) };
+    if fd_flags < 0
+        || unsafe {
+            libc::fcntl(
+                instance_lock.as_raw_fd(),
+                libc::F_SETFD,
+                fd_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(format!(
+            "无法设置 App 迁移锁：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    if !current_app.is_dir() {
+        return Err(format!("当前 App 路径不存在：{}", current_app.display()));
+    }
+    if destination_app.exists() {
+        return Err(format!(
+            "目标 App 路径已存在，未覆盖：{}",
+            destination_app.display()
+        ));
+    }
+    let home_directory = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is unavailable".to_string())?;
+    let beta_autostart_was_enabled = home_directory
+        .join("Library/LaunchAgents/Codex Taskboard Beta.plist")
+        .is_file();
+    let beta_autostart_marker = if beta_autostart_was_enabled { "1" } else { "0" };
+
+    rename_macos_app_bundle(&current_app, &destination_app)?;
+    append_macos_startup_log(&format!(
+        "Migrated macOS App bundle {} -> {}",
+        current_app.display(),
+        destination_app.display()
+    ));
+
+    let mut command = StdCommand::new(&destination_executable);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(MACOS_BUNDLE_MIGRATION_SOURCE_ENV, &current_executable)
+        .env(
+            MACOS_BUNDLE_MIGRATION_BETA_AUTOSTART_ENV,
+            beta_autostart_marker,
+        );
+    let exec_error = command.exec();
+
+    match rename_macos_app_bundle(&destination_app, &current_app) {
+        Ok(()) => Err(format!(
+            "无法从改名后的 App 重启，已恢复原路径：{exec_error}"
+        )),
+        Err(rollback_error) => {
+            append_macos_startup_log(&format!(
+                "Failed to restart renamed macOS App: {exec_error}; rollback failed: {rollback_error}"
+            ));
+            std::process::exit(1);
         }
     }
 }
@@ -417,15 +746,128 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), std::io::Erro
     Ok(())
 }
 
+fn collect_skill_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<bool, std::io::Error> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Ok(false);
+        }
+        if file_type.is_dir() {
+            let file_count = files.len();
+            if !collect_skill_files(root, &entry.path(), files)? {
+                return Ok(false);
+            }
+            if files.len() == file_count {
+                return Ok(false);
+            }
+        } else if file_type.is_file() {
+            files.push(entry.path().strip_prefix(root).unwrap().to_path_buf());
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn skill_directory_digest(directory: &Path) -> Result<Option<String>, std::io::Error> {
+    let mut files = Vec::new();
+    if !collect_skill_files(directory, directory, &mut files)? {
+        return Ok(None);
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    for relative_path in files {
+        let contents = fs::read(directory.join(&relative_path))?;
+        digest.update(relative_path.to_string_lossy().replace('\\', "/"));
+        digest.update([0]);
+        digest.update((contents.len() as u64).to_le_bytes());
+        digest.update(contents);
+    }
+    Ok(Some(format!("{:x}", digest.finalize())))
+}
+
+fn reconcile_legacy_skill(
+    home_directory: &Path,
+    bundled_skill: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>, std::io::Error> {
+    let legacy_skill = home_directory.join(".codex/skills/manage-taskboard");
+    let metadata = match fs::symlink_metadata(&legacy_skill) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.file_type().is_symlink() {
+        fs::remove_dir_all(legacy_skill)?;
+        return Ok(None);
+    }
+
+    if metadata.is_dir() {
+        let legacy_digest = skill_directory_digest(&legacy_skill)?;
+        let bundled_digest = skill_directory_digest(bundled_skill)?;
+        let known_copy = legacy_digest.as_ref().is_some_and(|digest| {
+            bundled_digest.as_ref() == Some(digest)
+                || KNOWN_TASKBOARD_SKILL_DIGESTS.contains(&digest.as_str())
+        });
+        if known_copy {
+            fs::remove_dir_all(legacy_skill)?;
+            return Ok(None);
+        }
+    }
+
+    let backup_path = home_directory
+        .join(".codex/taskboard-skill-backups")
+        .join(format!("manage-taskboard-{}", Uuid::new_v4()));
+    Ok(Some((legacy_skill, backup_path)))
+}
+
+fn resolve_legacy_skill_conflict(
+    app: &AppHandle,
+    legacy_skill: &Path,
+    backup_path: &Path,
+) -> Result<bool, std::io::Error> {
+    let proceed = app
+        .dialog()
+        .message(format!(
+            "检测到旧位置中的 manage-taskboard Skill 与当前 App 内置版本不同，可能包含你的修改。\n\n为避免 Codex 同时发现两个版本，Taskboard 会把旧副本完整保留到：\n\n{}\n\n选择退出不会改动旧副本，也不会启动 Codex。",
+            backup_path.display()
+        ))
+        .title("Codex Taskboard Skill 冲突")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "保留备份并继续".into(),
+            "退出".into(),
+        ))
+        .blocking_show();
+    if !proceed {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(backup_path.parent().unwrap())?;
+    fs::rename(legacy_skill, backup_path)?;
+    Ok(true)
+}
+
 fn loopback_listener() -> Result<TcpListener, String> {
     TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())
 }
 
-#[cfg(target_os = "macos")]
+fn taskboard_loopback_listener() -> Result<TcpListener, String> {
+    TcpListener::bind(("127.0.0.1", TASKBOARD_PREFERRED_PORT))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn taskboard_listener(state: &LauncherState) -> Result<(Option<i32>, u16), String> {
     let mut listener = state.taskboard_listener.lock().unwrap();
     if listener.is_none() {
-        *listener = Some(loopback_listener()?);
+        *listener = Some(taskboard_loopback_listener()?);
     }
     let listener = listener.as_ref().unwrap();
     let port = listener
@@ -437,7 +879,7 @@ fn taskboard_listener(state: &LauncherState) -> Result<(Option<i32>, u16), Strin
 
 #[cfg(target_os = "windows")]
 fn taskboard_listener(_state: &LauncherState) -> Result<(Option<i32>, u16), String> {
-    let listener = loopback_listener()?;
+    let listener = taskboard_loopback_listener()?;
     let port = listener
         .local_addr()
         .map_err(|error| error.to_string())?
@@ -446,7 +888,7 @@ fn taskboard_listener(_state: &LauncherState) -> Result<(Option<i32>, u16), Stri
     Ok((None, port))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn codex_port(state: &LauncherState) -> Result<u16, String> {
     let mut port = state.codex_port.lock().unwrap();
     if let Some(port) = *port {
@@ -510,6 +952,111 @@ fn show_error_dialog(app: &AppHandle, title: &str, message: &str) {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_launch_agent_executable(entry: &Path) -> Option<PathBuf> {
+    if !entry.is_file() {
+        return None;
+    }
+
+    let output = StdCommand::new("/usr/bin/plutil")
+        .args(["-extract", "ProgramArguments.0", "raw", "-o", "-"])
+        .arg(entry)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let executable = String::from_utf8(output.stdout).ok()?;
+    let executable = executable.trim_end_matches(|character| matches!(character, '\r' | '\n'));
+    (!executable.is_empty()).then(|| PathBuf::from(executable))
+}
+
+#[cfg(target_os = "macos")]
+fn sync_macos_autostart_path(
+    app: &AppHandle,
+    home_directory: &Path,
+    migration: &MacosBundleMigration,
+) -> Result<(), String> {
+    if !is_beta_release() {
+        return Ok(());
+    }
+
+    let launch_agents = home_directory.join("Library/LaunchAgents");
+    let stable_entry = launch_agents.join("Codex Taskboard.plist");
+    let migrate_stable_entry = macos_launch_agent_executable(&stable_entry).as_deref()
+        == Some(migration.source_executable.as_path());
+
+    if !migration.beta_autostart_was_enabled && !migrate_stable_entry {
+        return Ok(());
+    }
+    app.autolaunch()
+        .enable()
+        .map_err(|error| format!("无法更新 Beta 开机自启动路径：{error}"))?;
+    if !migrate_stable_entry {
+        return Ok(());
+    }
+    match fs::remove_file(&stable_entry) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "无法移除已迁移的开机自启动项 {}：{error}",
+            stable_entry.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_taskctl_symlink(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
+    let wrapper_path = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("无法定位当前 App 资源目录：{error}"))?
+        .join("bin/taskctl");
+    let wrapper_path = fs::canonicalize(&wrapper_path).map_err(|error| {
+        format!(
+            "无法定位当前 App 内置命令行工具 {}：{error}",
+            wrapper_path.display()
+        )
+    })?;
+    if !wrapper_path.is_file() {
+        return Err(format!(
+            "当前 App 内置命令行工具不是文件：{}",
+            wrapper_path.display()
+        ));
+    }
+
+    let system_path = PathBuf::from("/opt/homebrew/bin/taskctl");
+    let temporary_path = system_path.with_file_name(format!(
+        ".taskctl-codex-taskboard-{}.tmp",
+        Uuid::new_v4()
+    ));
+    std::os::unix::fs::symlink(&wrapper_path, &temporary_path).map_err(|error| {
+        format!(
+            "无法在 {} 创建符号链接：{error}",
+            system_path.parent().unwrap().display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&temporary_path, &system_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "无法替换系统命令 {}：{error}",
+            system_path.display()
+        ));
+    }
+
+    let installed_target = fs::read_link(&system_path)
+        .map_err(|error| format!("无法验证系统命令 {}：{error}", system_path.display()))?;
+    if installed_target != wrapper_path {
+        return Err(format!(
+            "系统命令未指向当前 App：{} -> {}",
+            system_path.display(),
+            installed_target.display()
+        ));
+    }
+
+    Ok((system_path, wrapper_path))
+}
+
+#[cfg(target_os = "macos")]
 fn find_codex_app(home_directory: &Path) -> Option<PathBuf> {
     [
         PathBuf::from("/Applications/ChatGPT.app"),
@@ -519,6 +1066,62 @@ fn find_codex_app(home_directory: &Path) -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|candidate| candidate.is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn ordinary_codex_process(app_path: &Path) -> Result<Option<u32>, String> {
+    let app_name = app_path
+        .file_stem()
+        .ok_or_else(|| "无法识别 Codex App 名称".to_string())?;
+    let executable = app_path.join("Contents/MacOS").join(app_name);
+    let output = StdCommand::new("/bin/ps")
+        .args(["-ww", "-axo", "pid=,command="])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("无法检查正在运行的 Codex".to_string());
+    }
+
+    let executable = executable.to_string_lossy();
+    let mut ordinary_pid = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim_start();
+        let Some(separator) = line.find(char::is_whitespace) else {
+            continue;
+        };
+        let command = line[separator..].trim_start();
+        if command != executable && !command.starts_with(&format!("{executable} ")) {
+            continue;
+        }
+        if command.contains(" --remote-debugging-port=") {
+            return Ok(None);
+        }
+        ordinary_pid = line[..separator].parse().ok();
+    }
+    Ok(ordinary_pid)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_is_running(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn quit_codex_normally(pid: u32) -> Result<(), String> {
+    let application =
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid as libc::pid_t)
+            .ok_or_else(|| "无法找到正在运行的 Codex".to_string())?;
+    if !application.terminate() {
+        return Err("Codex 没有接受退出请求".to_string());
+    }
+    let deadline = Instant::now() + LAUNCHER_STOP_TIMEOUT;
+    while process_is_running(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    if process_is_running(pid) {
+        return Err("Codex 尚未退出，任务面板没有启动".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -536,8 +1139,170 @@ fn find_codex_app(_home_directory: &Path) -> Option<PathBuf> {
         return None;
     }
     let install_location = String::from_utf8_lossy(&output.stdout);
-    let candidate = PathBuf::from(install_location.trim()).join("app/ChatGPT.exe");
+    let candidate = PathBuf::from(install_location.trim())
+        .join("app")
+        .join("ChatGPT.exe");
     candidate.is_file().then_some(candidate)
+}
+
+#[cfg(target_os = "windows")]
+fn ordinary_codex_process(app_path: &Path, codex_profile: &Path) -> Result<Option<u32>, String> {
+    let output = StdCommand::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference = 'Stop'; $app = $env:CODEX_TASKBOARD_CODEX_APP_PATH; $profile = $env:CODEX_TASKBOARD_CODEX_PROFILE; $name = [IO.Path]::GetFileName($app); $all = @(Get-CimInstance Win32_Process -Filter \"Name = '$name'\" | Where-Object { $_.ExecutablePath -eq $app }); $pids = @{}; foreach ($item in $all) { $pids[[uint32]$item.ProcessId] = $true }; $process = $all | Where-Object { $command = [string]$_.CommandLine; $isRoot = -not $pids.ContainsKey([uint32]$_.ParentProcessId); $usesManagedProfile = $command.IndexOf('--user-data-dir', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $command.IndexOf($profile, [StringComparison]::OrdinalIgnoreCase) -ge 0; $usesPrivateCdp = $command.IndexOf('--remote-debugging-pipe', [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $command.IndexOf('--remote-debugging-port', [StringComparison]::OrdinalIgnoreCase) -ge 0; $isManaged = $usesManagedProfile -and $usesPrivateCdp; $isRoot -and -not $isManaged } | Select-Object -First 1; if ($null -ne $process) { [Console]::Out.Write($process.ProcessId) }",
+        ])
+        .env("CODEX_TASKBOARD_CODEX_APP_PATH", app_path)
+        .env("CODEX_TASKBOARD_CODEX_PROFILE", codex_profile)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("无法检查正在运行的 Codex".to_string());
+    }
+    let pid = String::from_utf8_lossy(&output.stdout);
+    let pid = pid.trim();
+    if pid.is_empty() {
+        return Ok(None);
+    }
+    pid.parse()
+        .map(Some)
+        .map_err(|_| "无法检查正在运行的 Codex".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn quit_codex_normally(pid: u32) -> Result<(), String> {
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    let mut creation_time = FILETIME::default();
+    let mut exit_time = FILETIME::default();
+    let mut kernel_time = FILETIME::default();
+    let mut user_time = FILETIME::default();
+    if unsafe {
+        GetProcessTimes(
+            process,
+            &mut creation_time,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        )
+    }
+    .is_err()
+    {
+        let _ = unsafe { CloseHandle(process) };
+        return Err("无法检查正在运行的 Codex".to_string());
+    }
+
+    let mut session = 0;
+    let mut session_key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+    let started = unsafe { RmStartSession(&mut session, None, PWSTR(session_key.as_mut_ptr())) };
+    if started != ERROR_SUCCESS {
+        let _ = unsafe { CloseHandle(process) };
+        return Err("无法请求 Codex 退出".to_string());
+    }
+    let application = RM_UNIQUE_PROCESS {
+        dwProcessId: pid,
+        ProcessStartTime: creation_time,
+    };
+    let registered = unsafe { RmRegisterResources(session, None, Some(&[application]), None) };
+    let shutdown = if registered == ERROR_SUCCESS {
+        unsafe { RmShutdown(session, 0, None) }
+    } else {
+        registered
+    };
+    let _ = unsafe { RmEndSession(session) };
+    if shutdown != ERROR_SUCCESS {
+        let _ = unsafe { CloseHandle(process) };
+        return Err("Codex 没有接受退出请求".to_string());
+    }
+
+    let exited = unsafe {
+        WaitForSingleObject(
+            process,
+            LAUNCHER_STOP_TIMEOUT.as_millis().try_into().unwrap(),
+        )
+    } == WAIT_OBJECT_0;
+    let _ = unsafe { CloseHandle(process) };
+    if exited {
+        Ok(())
+    } else {
+        Err("Codex 尚未退出，任务面板没有启动".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_codex_app(_home_directory: &Path) -> Option<PathBuf> {
+    let candidate = PathBuf::from("/usr/lib/chatgpt/ChatGPT");
+    candidate.is_file().then_some(candidate)
+}
+
+#[cfg(target_os = "linux")]
+fn ordinary_codex_process(app_path: &Path, codex_profile: &Path) -> Result<Option<u32>, String> {
+    let output = StdCommand::new("/bin/ps")
+        .args(["-ww", "-axo", "pid=,ppid=,command="])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("无法检查正在运行的 Codex".to_string());
+    }
+
+    let executable = app_path.to_string_lossy();
+    let mut processes = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim_start();
+        let Some(pid_separator) = line.find(char::is_whitespace) else {
+            continue;
+        };
+        let Some(pid) = line[..pid_separator].parse::<u32>().ok() else {
+            continue;
+        };
+        let parent_and_command = line[pid_separator..].trim_start();
+        let Some(parent_separator) = parent_and_command.find(char::is_whitespace) else {
+            continue;
+        };
+        let Some(parent_pid) = parent_and_command[..parent_separator].parse::<u32>().ok() else {
+            continue;
+        };
+        let command = parent_and_command[parent_separator..].trim_start();
+        if command != executable && !command.starts_with(&format!("{executable} ")) {
+            continue;
+        }
+        processes.push((pid, parent_pid, command.to_string()));
+    }
+
+    let managed_profile = format!("--user-data-dir={}", codex_profile.display());
+    Ok(processes
+        .iter()
+        .find(|(pid, parent_pid, command)| {
+            !processes
+                .iter()
+                .any(|(candidate_pid, _, _)| candidate_pid == parent_pid && candidate_pid != pid)
+                && !(command.contains(" --remote-debugging-pipe")
+                    && command.contains(&format!(" {managed_profile}")))
+        })
+        .map(|(pid, _, _)| *pid))
+}
+
+#[cfg(target_os = "linux")]
+fn quit_codex_normally(pid: u32) -> Result<(), String> {
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+        return Err("Codex 没有接受退出请求".to_string());
+    }
+    let deadline = Instant::now() + LAUNCHER_STOP_TIMEOUT;
+    while process_is_running(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    if process_is_running(pid) {
+        return Err("Codex 尚未退出，任务面板没有启动".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -550,7 +1315,12 @@ fn missing_codex_app_message() -> String {
     "未找到官方 Codex App。请先从 Microsoft Store 安装。".to_string()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+fn missing_codex_app_message() -> String {
+    "未找到官方 ChatGPT App。请先安装 Ubuntu x64 .deb。".to_string()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn send_process_group_signal(pid: u32, signal: i32) {
     unsafe {
         if libc::kill(-(pid as i32), signal) != 0 {
@@ -559,7 +1329,7 @@ fn send_process_group_signal(pid: u32, signal: i32) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_group_is_running(pid: u32) -> bool {
     unsafe { libc::kill(-(pid as i32), 0) == 0 }
 }
@@ -579,9 +1349,11 @@ fn process_group_is_running(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-#[cfg(target_os = "macos")]
-fn signal_pending_taskboard_open(state: &LauncherState) -> Result<(), String> {
-    let mut snapshot = state.snapshot.lock().unwrap();
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn signal_pending_taskboard_open(
+    _state: &LauncherState,
+    snapshot: &mut LauncherSnapshot,
+) -> Result<(), String> {
     if !snapshot.open_request_pending {
         return Ok(());
     }
@@ -596,8 +1368,10 @@ fn signal_pending_taskboard_open(state: &LauncherState) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn signal_pending_taskboard_open(state: &LauncherState) -> Result<(), String> {
-    let mut snapshot = state.snapshot.lock().unwrap();
+fn signal_pending_taskboard_open(
+    state: &LauncherState,
+    snapshot: &mut LauncherSnapshot,
+) -> Result<(), String> {
     if !snapshot.open_request_pending {
         return Ok(());
     }
@@ -630,7 +1404,7 @@ fn wait_for_process_group_exit(pid: u32, timeout: Duration) -> bool {
     !process_group_is_running(pid)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn terminate_process_group(pid: u32) {
     send_process_group_signal(pid, libc::SIGTERM);
     if !wait_for_process_group_exit(pid, STOP_TIMEOUT) {
@@ -648,7 +1422,7 @@ fn terminate_process_group(pid: u32) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn stop_launcher_process_group(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
@@ -664,7 +1438,7 @@ fn stop_launcher_process_group(pid: u32) {
     terminate_process_group(pid);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_matches_record(record: &LauncherPidRecord) -> bool {
     let output = StdCommand::new("/bin/ps")
         .args(["-p", &record.pid.to_string(), "-o", "command="])
@@ -749,7 +1523,7 @@ fn stop_managed_child_locked(app: &AppHandle, state: &Arc<LauncherState>) {
         if !wait_for_process_group_exit(pid, STOP_TIMEOUT) {
             terminate_process_group(pid);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         stop_launcher_process_group(pid);
         clear_pid_record(state, pid);
     }
@@ -777,64 +1551,48 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             append_log(&state, &line);
-            if is_stderr && line.contains("Waiting for Codex") {
-                update_snapshot(&app, &state, |snapshot| {
-                    if state.generation.load(Ordering::SeqCst) == generation
-                        && snapshot.child_pid == Some(pid)
-                    {
+            if is_stderr {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<LauncherEvent>(&line) else {
+                continue;
+            };
+            update_snapshot(&app, &state, |snapshot| {
+                if state.generation.load(Ordering::SeqCst) != generation
+                    || snapshot.child_pid != Some(pid)
+                {
+                    return;
+                }
+                match event {
+                    LauncherEvent::WaitingForCodex => {
                         snapshot.phase = "starting".into();
                         snapshot.message = "正在等待 Codex 窗口…".into();
                     }
-                });
-            } else if !is_stderr && line.contains("Codex Taskboard listening") {
-                update_snapshot(&app, &state, |snapshot| {
-                    if state.generation.load(Ordering::SeqCst) == generation
-                        && snapshot.child_pid == Some(pid)
-                    {
+                    LauncherEvent::ServiceReady => {
                         snapshot.phase = "starting".into();
                         snapshot.message = "任务面板服务已启动，正在注入 Codex…".into();
                     }
-                });
-            } else if !is_stderr && line.contains("\"openTaskboardSignalReady\":true") {
-                let snapshot = update_snapshot(&app, &state, |snapshot| {
-                    if state.generation.load(Ordering::SeqCst) == generation
-                        && snapshot.child_pid == Some(pid)
-                    {
+                    LauncherEvent::OpenSignalReady => {
                         snapshot.open_signal_pid = Some(pid);
+                        if let Err(error) = signal_pending_taskboard_open(&state, snapshot) {
+                            append_log(&state, &format!("Taskboard open signal failed: {error}"));
+                        }
                     }
-                });
-                if snapshot.child_pid == Some(pid) && snapshot.open_signal_pid == Some(pid) {
-                    if let Err(error) = signal_pending_taskboard_open(&state) {
-                        append_log(&state, &format!("Taskboard open signal failed: {error}"));
+                    LauncherEvent::OpenSignalQueued => {
+                        if snapshot.open_signal_pid == Some(pid) {
+                            snapshot.open_request_pending = false;
+                        }
                     }
-                }
-            } else if !is_stderr && line.contains("\"openTaskboardSignalQueued\":true") {
-                let mut snapshot = state.snapshot.lock().unwrap();
-                if state.generation.load(Ordering::SeqCst) == generation
-                    && snapshot.child_pid == Some(pid)
-                    && snapshot.open_signal_pid == Some(pid)
-                {
-                    snapshot.open_request_pending = false;
-                }
-            } else if !is_stderr && line.contains("\"openedTaskboardInExistingCodex\":true") {
-                update_snapshot(&app, &state, |snapshot| {
-                    if state.generation.load(Ordering::SeqCst) == generation
-                        && snapshot.child_pid == Some(pid)
-                    {
+                    LauncherEvent::OpenedInExistingCodex => {
                         snapshot.phase = "running".into();
                         snapshot.message = "任务面板已在现有 Codex 的浏览面板中打开。".into();
                     }
-                });
-            } else if !is_stderr && line.contains("\"injected\"") {
-                update_snapshot(&app, &state, |snapshot| {
-                    if state.generation.load(Ordering::SeqCst) == generation
-                        && snapshot.child_pid == Some(pid)
-                    {
+                    LauncherEvent::Injected => {
                         snapshot.phase = "running".into();
                         snapshot.message = "任务面板已在 Codex 客户端中打开。".into();
                     }
-                });
-            }
+                }
+            });
         }
     });
 }
@@ -861,10 +1619,46 @@ fn start_launcher_locked(
         .ok_or_else(|| "无法定位 App 可执行文件目录".to_string())?
         .join(if cfg!(target_os = "windows") {
             "node.exe"
+        } else if cfg!(target_os = "linux") {
+            "codex-taskboard-node"
         } else {
             "node"
         });
+    let codex_profile = state.data_directory.join("codex-profile");
     stop_recorded_child(state);
+    #[cfg(target_os = "macos")]
+    let ordinary_codex_pid = ordinary_codex_process(&codex_app)?;
+    #[cfg(target_os = "windows")]
+    let ordinary_codex_pid = ordinary_codex_process(&codex_app, &codex_profile)?;
+    #[cfg(target_os = "linux")]
+    let ordinary_codex_pid = ordinary_codex_process(&codex_app, &codex_profile)?;
+    if let Some(codex_pid) = ordinary_codex_pid {
+        let restart = app
+            .dialog()
+            .message("需要重新启动 Codex 才能显示任务面板")
+            .title("Codex Taskboard")
+            .kind(MessageDialogKind::Info)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "重新启动 Codex".into(),
+                "取消".into(),
+            ))
+            .blocking_show();
+        if !restart {
+            append_log(state, "Codex restart canceled by user");
+            return Ok(update_snapshot(app, state, |snapshot| {
+                snapshot.phase = "stopped".into();
+                snapshot.message = "已取消重新启动 Codex，任务面板未注入。".into();
+                snapshot.app_path = Some(codex_app.display().to_string());
+                snapshot.open_signal_pid = None;
+                snapshot.open_request_pending = false;
+            }));
+        }
+        append_log(
+            state,
+            &format!("Requesting normal Codex exit for PID {codex_pid}"),
+        );
+        quit_codex_normally(codex_pid)?;
+    }
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     state.intentional_stop.store(false, Ordering::SeqCst);
     update_snapshot(app, state, |snapshot| {
@@ -879,7 +1673,7 @@ fn start_launcher_locked(
         "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         resource_directory.join("bin").display()
     );
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     let path_value = {
         let current_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::join_paths(
@@ -889,12 +1683,13 @@ fn start_launcher_locked(
         .map_err(|error| error.to_string())?
     };
     let (_taskboard_listener_fd, taskboard_port) = taskboard_listener(state)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let codex_port = codex_port(state)?.to_string();
     let instance_token = Uuid::new_v4().to_string();
     let instance_secret = Uuid::new_v4().to_string();
     let version = state.snapshot.lock().unwrap().version.clone();
-    let codex_profile = state.data_directory.join("codex-profile");
+    let manage_taskboard_skill_path =
+        home_directory.join(".agents/skills/manage-taskboard/SKILL.md");
     #[cfg(target_os = "macos")]
     let codex_source_profile = home_directory.join("Library/Application Support/Codex");
     #[cfg(target_os = "windows")]
@@ -902,14 +1697,22 @@ fn start_launcher_locked(
         .map(PathBuf::from)
         .ok_or_else(|| "APPDATA is unavailable".to_string())?
         .join("Codex/web/Codex");
+    #[cfg(target_os = "linux")]
+    let codex_source_profile = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_directory.join(".config"))
+        .join("Codex");
     let mut command = StdCommand::new(&node_path);
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW.0);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     command.arg(&injector_path);
     #[cfg(target_os = "windows")]
     command.arg(r"scripts\codex-injector.mjs");
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     command.args(["--launch", "--watch", "--open", "--port", &codex_port]);
-    #[cfg(target_os = "windows")]
+    #[cfg(target_os = "linux")]
     command.args(["--launch", "--watch", "--open", "--cdp-pipe"]);
     command
         .args(["--startup-token", &instance_token, "--app-path"])
@@ -924,6 +1727,7 @@ fn start_launcher_locked(
         .env("CODEX_TASKBOARD_INSTANCE_TOKEN", &instance_token)
         .env("CODEX_TASKBOARD_INSTANCE_SECRET", &instance_secret)
         .env("CODEX_TASKBOARD_VERSION", &version)
+        .env("CODEX_TASKBOARD_SKILL_PATH", &manage_taskboard_skill_path)
         .env_remove("CODEX_API_KEY")
         .env(
             "CODEX_TASKBOARD_CODEX_PROFILE",
@@ -940,7 +1744,7 @@ fn start_launcher_locked(
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     command.stdin(Stdio::piped());
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     unsafe {
         let taskboard_listener_fd = _taskboard_listener_fd.unwrap();
         command
@@ -975,14 +1779,14 @@ fn start_launcher_locked(
     let snapshot = update_snapshot(app, state, |snapshot| {
         snapshot.child_pid = Some(pid);
     });
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     append_log(
         state,
         &format!(
             "Started launcher child {pid} on Taskboard {taskboard_port} with Codex CDP {codex_port}"
         ),
     );
-    #[cfg(target_os = "windows")]
+    #[cfg(target_os = "linux")]
     append_log(
         state,
         &format!(
@@ -1116,9 +1920,7 @@ fn restart_launcher(
         }
         stop_managed_child_locked(app, state);
         let result = start_launcher_locked(app, state);
-        if result.is_err() {
-            state.intentional_stop.store(false, Ordering::SeqCst);
-        }
+        state.intentional_stop.store(false, Ordering::SeqCst);
         let generation = state.generation.load(Ordering::SeqCst);
         (result, generation)
     };
@@ -1138,8 +1940,9 @@ fn restart_launcher(
 }
 
 fn open_taskboard(state: &LauncherState) -> Result<(), String> {
-    state.snapshot.lock().unwrap().open_request_pending = true;
-    signal_pending_taskboard_open(state)
+    let mut snapshot = state.snapshot.lock().unwrap();
+    snapshot.open_request_pending = true;
+    signal_pending_taskboard_open(state, &mut snapshot)
 }
 
 fn open_taskboard_in_browser(state: &LauncherState) -> Result<(), String> {
@@ -1158,6 +1961,11 @@ fn open_taskboard_in_browser(state: &LauncherState) -> Result<(), String> {
         .args(["url.dll,FileProtocolHandler", &url])
         .status()
         .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "linux")]
+    let status = StdCommand::new("xdg-open")
+        .arg(&url)
+        .status()
+        .map_err(|error| error.to_string())?;
     status
         .success()
         .then_some(())
@@ -1172,8 +1980,32 @@ async fn check_for_startup_update(
         snapshot.update_message = "正在检查更新…".into();
         snapshot.update_available = false;
     });
-    let update = app
-        .updater()
+    let beta_release = is_beta_release();
+    let current_release_version = if beta_release {
+        release_version()
+            .parse()
+            .map_err(|error| format!("Invalid release version {}: {error}", release_version()))?
+    } else {
+        app.package_info().version.clone()
+    };
+    let mut updater_builder = app.updater_builder();
+    if beta_release {
+        let beta_endpoint = BETA_UPDATER_ENDPOINT
+            .parse()
+            .map_err(|error| format!("Invalid Beta updater endpoint: {error}"))?;
+        updater_builder = updater_builder
+            .endpoints(vec![beta_endpoint])
+            .map_err(|error| error.to_string())?;
+    }
+    let update = updater_builder
+        .version_comparator(move |current, release| {
+            if beta_release {
+                release.version > current_release_version
+            } else {
+                release.version > current
+            }
+        })
+        .build()
         .map_err(|error| error.to_string())?
         .check()
         .await
@@ -1190,7 +2022,8 @@ async fn check_for_startup_update(
         None => {
             append_log(state, "No update is available");
             update_snapshot(app, state, |snapshot| {
-                snapshot.update_message = "当前已是最新版本。".into();
+                snapshot.update_message =
+                    format!("当前版本 {} 已是最新版本。", snapshot.version.as_str());
                 snapshot.update_available = false;
             });
         }
@@ -1198,204 +2031,140 @@ async fn check_for_startup_update(
     Ok(update)
 }
 
-async fn download_update<C: FnMut(usize, Option<u64>), D: FnOnce()>(
+async fn prepare_update(
     app: &AppHandle,
+    state: &Arc<LauncherState>,
     update: &Update,
-    cancel_requested: &AtomicBool,
-    mut on_chunk: C,
-    on_download_finish: D,
-) -> Result<Option<Vec<u8>>, String> {
-    let pubkey = app
-        .config()
-        .plugins
-        .0
-        .get("updater")
-        .and_then(|value| value.get("pubkey"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or("Updater public key is unavailable")?;
-    let mut headers = update.headers.clone();
-    if !headers.contains_key(ACCEPT) {
-        headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
-    }
-    let mut request = reqwest::Client::builder().user_agent("tauri-plugin-updater/2.10.1");
-    if let Some(timeout) = update.timeout {
-        request = request.timeout(timeout);
-    }
-    if update.no_proxy {
-        request = request.no_proxy();
-    } else if let Some(proxy) = &update.proxy {
-        request =
-            request.proxy(reqwest::Proxy::all(proxy.as_str()).map_err(|error| error.to_string())?);
-    }
-    let response = request
-        .build()
-        .map_err(|error| error.to_string())?
-        .get(update.download_url.clone())
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Download request failed with status: {}",
-            response.status()
-        ));
-    }
-    let content_length = response
-        .headers()
-        .get("Content-Length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok());
-    let mut buffer = Vec::new();
-    let mut stream = response.bytes_stream();
-    loop {
-        if cancel_requested.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        let Some(chunk) = stream.next().await else {
-            break;
-        };
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        if cancel_requested.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        on_chunk(chunk.len(), content_length);
-        if cancel_requested.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        buffer.extend_from_slice(&chunk);
-    }
-    if cancel_requested.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-    on_download_finish();
-    if cancel_requested.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-    let pubkey = base64::engine::general_purpose::STANDARD
-        .decode(pubkey)
-        .map_err(|error| error.to_string())?;
-    let pubkey = std::str::from_utf8(&pubkey).map_err(|error| error.to_string())?;
-    let pubkey = PublicKey::decode(pubkey).map_err(|error| error.to_string())?;
-    let signature = base64::engine::general_purpose::STANDARD
-        .decode(&update.signature)
-        .map_err(|error| error.to_string())?;
-    let signature = std::str::from_utf8(&signature).map_err(|error| error.to_string())?;
-    let signature = Signature::decode(signature).map_err(|error| error.to_string())?;
-    pubkey
-        .verify(&buffer, &signature, true)
-        .map_err(|error| error.to_string())?;
-    Ok(Some(buffer))
+    dialog: &Arc<Mutex<Option<UpdateDialog>>>,
+) -> Result<Vec<u8>, String> {
+    let update_version = update.version.clone();
+    append_log(
+        state,
+        &format!("Downloading update {update_version} before confirmation"),
+    );
+    update_snapshot(app, state, |snapshot| {
+        snapshot.update_message = format!("正在下载 {update_version}…");
+        snapshot.update_available = true;
+    });
+    let progress_app = app.clone();
+    let progress_state = Arc::clone(state);
+    let progress_version = update_version.clone();
+    let finish_app = app.clone();
+    let finish_state = Arc::clone(state);
+    let progress_dialog = Arc::clone(dialog);
+    let finish_dialog = Arc::clone(dialog);
+    let mut downloaded = 0_u64;
+    let mut displayed_progress = None;
+    let bytes = update.download(
+        move |chunk_length, content_length| {
+            downloaded = downloaded.saturating_add(chunk_length as u64);
+            let progress = content_length.filter(|total| *total > 0).map(|total| {
+                downloaded
+                    .saturating_mul(100)
+                    .saturating_div(total)
+                    .min(100)
+            });
+            if progress == displayed_progress {
+                return;
+            }
+            displayed_progress = progress;
+            let snapshot = update_snapshot(&progress_app, &progress_state, |snapshot| {
+                snapshot.update_message = match progress {
+                    Some(progress) => format!("正在下载 {progress_version} · {progress}%"),
+                    None => format!("正在下载 {progress_version}…"),
+                };
+            });
+            let dialog = progress_dialog.lock().unwrap().clone();
+            if let Some(dialog) = dialog {
+                dialog.set_progress(&snapshot.update_message, progress, false);
+            }
+        },
+        move || {
+            let snapshot = update_snapshot(&finish_app, &finish_state, |snapshot| {
+                snapshot.update_message = "正在验证更新…".into();
+            });
+            let dialog = finish_dialog.lock().unwrap().clone();
+            if let Some(dialog) = dialog {
+                dialog.set_progress(&snapshot.update_message, None, false);
+            }
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    append_log(
+        state,
+        &format!("Downloaded and verified update {update_version}"),
+    );
+    update_snapshot(app, state, |snapshot| {
+        snapshot.update_message = format!("{update_version} 已下载并通过签名验证，等待安装。");
+        snapshot.update_available = true;
+    });
+    Ok(bytes)
 }
 
-async fn install_update(
+async fn prepare_available_update(
+    app: &AppHandle,
+    state: &Arc<LauncherState>,
+    refresh: bool,
+) -> Result<Option<PendingUpdate>, String> {
+    let mut pending = state.pending_update.lock().await;
+    if let Some(current) = pending.as_ref() {
+        if matches!(current.download.peek(), Some(Err(_))) {
+            *pending = None;
+        } else if !refresh || current.download.peek().is_none() {
+            return Ok(Some(current.clone()));
+        }
+    }
+    let Some(update) = check_for_startup_update(app, state).await? else {
+        *pending = None;
+        return Ok(None);
+    };
+    if let Some(current) = pending.as_ref() {
+        if current.update.version == update.version {
+            return Ok(Some(current.clone()));
+        }
+    }
+
+    let dialog = Arc::new(Mutex::new(None));
+    let download = {
+        let app = app.clone();
+        let state = Arc::clone(state);
+        let update = update.clone();
+        let dialog = Arc::clone(&dialog);
+        async move {
+            let result = prepare_update(&app, &state, &update, &dialog).await;
+            if let Err(error) = &result {
+                append_log(&state, &format!("Update {} preparation failed: {error}", update.version));
+                update_snapshot(&app, &state, |snapshot| {
+                    snapshot.update_message = format!("更新下载或签名验证失败：{error}");
+                    snapshot.update_available = true;
+                });
+            }
+            result.map(Arc::new)
+        }.boxed().shared()
+    };
+    tauri::async_runtime::spawn(download.clone());
+    let prepared = PendingUpdate { update, download, dialog };
+    *pending = Some(prepared.clone());
+    Ok(Some(prepared))
+}
+
+fn install_update(
     app: &AppHandle,
     state: &Arc<LauncherState>,
     update: Update,
+    bytes: &[u8],
     update_dialog: &UpdateDialog,
 ) -> Result<(), String> {
     let update_version = update.version.clone();
     state.update_in_progress.store(true, Ordering::SeqCst);
-    let snapshot = update_snapshot(app, state, |snapshot| {
-        snapshot.update_message = format!("正在下载 {update_version}…");
-        snapshot.update_available = false;
-    });
-    let (cancel, mut cancel_receiver) = tauri::async_runtime::channel(1);
-    let cancel_requested = Arc::new(AtomicBool::new(false));
-    update_dialog.show_progress(
-        &snapshot.update_message,
-        cancel,
-        Arc::clone(&cancel_requested),
-    );
-    let progress_app = app.clone();
-    let progress_state = Arc::clone(state);
-    let progress_version = update_version.clone();
-    let progress_dialog = update_dialog.clone();
-    let finish_app = app.clone();
-    let finish_state = Arc::clone(state);
-    let finish_dialog = update_dialog.clone();
-    let mut downloaded = 0_u64;
-    let download_result = {
-        let download = download_update(
-            app,
-            &update,
-            &cancel_requested,
-            move |chunk_length, content_length| {
-                downloaded = downloaded.saturating_add(chunk_length as u64);
-                let progress = content_length.filter(|total| *total > 0).map(|total| {
-                    downloaded
-                        .saturating_mul(100)
-                        .saturating_div(total)
-                        .min(100)
-                });
-                let snapshot = update_snapshot(&progress_app, &progress_state, |snapshot| {
-                    snapshot.update_message = match progress {
-                        Some(progress) => {
-                            format!("正在下载 {progress_version} · {progress}%")
-                        }
-                        None => format!("正在下载 {progress_version}…"),
-                    };
-                });
-                progress_dialog.set_progress(&snapshot.update_message, progress, true);
-            },
-            move || {
-                let snapshot = update_snapshot(&finish_app, &finish_state, |snapshot| {
-                    snapshot.update_message = "正在验证更新…".into();
-                });
-                finish_dialog.set_progress(&snapshot.update_message, Some(100), false);
-            },
-        );
-        let mut download = std::pin::pin!(download);
-        poll_fn(|cx| {
-            if cancel_requested.load(Ordering::SeqCst)
-                || matches!(cancel_receiver.poll_recv(cx), Poll::Ready(Some(())))
-            {
-                return Poll::Ready(Ok(None));
-            }
-            match download.as_mut().poll(cx) {
-                Poll::Ready(result) => {
-                    if cancel_requested.load(Ordering::SeqCst)
-                        || matches!(cancel_receiver.poll_recv(cx), Poll::Ready(Some(())))
-                    {
-                        Poll::Ready(Ok(None))
-                    } else {
-                        Poll::Ready(result)
-                    }
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await
-    };
-    let bytes = match download_result {
-        Ok(None) => {
-            append_log(
-                state,
-                &format!("Update {update_version} download cancelled by user"),
-            );
-            state.update_in_progress.store(false, Ordering::SeqCst);
-            update_snapshot(app, state, |snapshot| {
-                snapshot.update_message = "更新已取消。".into();
-                snapshot.update_available = true;
-            });
-            return Ok(());
-        }
-        Ok(Some(bytes)) => bytes,
-        Err(error) => {
-            append_log(state, &format!("Update download failed: {error}"));
-            state.update_in_progress.store(false, Ordering::SeqCst);
-            update_snapshot(app, state, |snapshot| {
-                snapshot.update_message = format!("更新下载或签名验证失败：{error}");
-                snapshot.update_available = true;
-            });
-            return Err(error);
-        }
-    };
 
     let snapshot = update_snapshot(app, state, |snapshot| {
         snapshot.update_message = "正在安装更新…".into();
+        snapshot.update_available = false;
     });
-    update_dialog.set_progress(&snapshot.update_message, None, false);
+    update_dialog.show_installing(&snapshot.update_message);
     {
         let _lifecycle = state.lifecycle.lock().unwrap();
         if state.intentional_stop.load(Ordering::SeqCst) {
@@ -1403,7 +2172,7 @@ async fn install_update(
         }
         stop_managed_child_locked(app, state);
     }
-    if let Err(error) = update.install(&bytes) {
+    if let Err(error) = update.install(bytes) {
         append_log(state, &format!("Update installation failed: {error}"));
         let restart_error = {
             let _lifecycle = state.lifecycle.lock().unwrap();
@@ -1475,15 +2244,20 @@ async fn offer_update(
         check_update.set_enabled(false).unwrap();
         return;
     }
-    if state
-        .update_flow_in_progress
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if show_current_version {
+        if state
+            .update_flow_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        check_update.set_text("正在检查更新…").unwrap();
+        check_update.set_enabled(false).unwrap();
+    } else if state.update_flow_in_progress.load(Ordering::SeqCst) {
         return;
     }
-    check_update.set_enabled(false).unwrap();
-    let update = match check_for_startup_update(app, state).await {
+    let update = match prepare_available_update(app, state, !show_current_version).await {
         Ok(update) => update,
         Err(error) => {
             append_log(state, &format!("Update check failed: {error}"));
@@ -1497,33 +2271,59 @@ async fn offer_update(
                     "Codex Taskboard 更新检查失败",
                     &format!("无法检查更新。请稍后重试。\n\n{error}"),
                 );
+                finish_update_flow(state, check_update, quit);
             }
-            finish_update_flow(state, check_update, quit);
             return;
         }
     };
+    if !show_current_version {
+        return;
+    }
     let Some(update) = update else {
-        if show_current_version {
-            app.dialog()
-                .message("当前已是最新版本。")
-                .title("Codex Taskboard 更新")
-                .buttons(MessageDialogButtons::Ok)
-                .blocking_show();
-        }
+        let current_version = state.snapshot.lock().unwrap().version.clone();
+        app.dialog()
+            .message(format!("当前版本 {current_version} 已是最新版本。"))
+            .title("Codex Taskboard 更新")
+            .buttons(MessageDialogButtons::Ok)
+            .blocking_show();
         finish_update_flow(state, check_update, quit);
         return;
     };
 
-    let version = update.version.clone();
+    let version = update.update.version.clone();
     append_log(state, &format!("Showing update prompt for {version}"));
-    let Some(update_dialog) = UpdateDialog::prompt(&version) else {
+    let Some(update_dialog) = UpdateDialog::prompt(app, &version) else {
         append_log(state, &format!("Update {version} deferred by user"));
+        update_snapshot(app, state, |snapshot| {
+            snapshot.update_message =
+                format!("已暂缓安装 {version}，可稍后从检查更新继续。");
+            snapshot.update_available = true;
+        });
         finish_update_flow(state, check_update, quit);
         return;
     };
     append_log(state, &format!("Update {version} accepted by user"));
+    if update.download.peek().is_none() {
+        update_dialog.set_progress("正在下载或验证更新…", None, false);
+    }
+    *update.dialog.lock().unwrap() = Some(update_dialog.clone());
+    let result = update.download.clone().await;
+    *update.dialog.lock().unwrap() = None;
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            update_dialog.close();
+            show_error_dialog(
+                app,
+                "Codex Taskboard 更新准备失败",
+                &format!("无法下载或验证更新。请稍后重试。\n\n{error}"),
+            );
+            finish_update_flow(state, check_update, quit);
+            return;
+        }
+    };
     quit.set_enabled(false).unwrap();
-    match install_update(app, state, update, &update_dialog).await {
+    match install_update(app, state, update.update, &bytes, &update_dialog) {
         Ok(()) => {
             update_dialog.close();
             finish_update_flow(state, check_update, quit);
@@ -1550,6 +2350,15 @@ async fn offer_update(
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    let macos_bundle_migration = match migrate_macos_beta_app_bundle_name() {
+        Ok(migration) => migration,
+        Err(error) => {
+            append_macos_startup_log(&format!("macOS App bundle migration failed: {error}"));
+            None
+        }
+    };
+
     let app = tauri::Builder::default()
         .enable_macos_default_menu(false)
         .plugin(tauri_plugin_autostart::init(
@@ -1558,7 +2367,7 @@ fn main() {
         ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(ActivationPolicy::Accessory);
             let home_directory = app.path().home_dir()?;
@@ -1566,6 +2375,7 @@ fn main() {
                 .path()
                 .resource_dir()?
                 .join("app/skills/manage-taskboard");
+            let legacy_skill_conflict = reconcile_legacy_skill(&home_directory, &bundled_skill)?;
             let global_skill = home_directory.join(".agents/skills/manage-taskboard");
             if global_skill.exists() {
                 fs::remove_dir_all(&global_skill)?;
@@ -1585,6 +2395,18 @@ fn main() {
                 .map(PathBuf::from)
                 .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is unavailable"))?
                 .join("Codex Taskboard/Logs");
+            #[cfg(target_os = "linux")]
+            let data_directory = std::env::var_os("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home_directory.join(".local/share"))
+                .join("Codex Taskboard");
+            #[cfg(target_os = "linux")]
+            let log_directory = std::env::var_os("XDG_STATE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home_directory.join(".local/state"))
+                .join("Codex Taskboard");
             fs::create_dir_all(&data_directory)?;
             fs::create_dir_all(&log_directory)?;
             let Some(instance_lock) = acquire_instance_lock(&data_directory.join("launcher.lock"))?
@@ -1592,7 +2414,7 @@ fn main() {
                 app.handle().exit(0);
                 return Ok(());
             };
-            let version = app.package_info().version.to_string();
+            let version = release_version().to_string();
             let state = Arc::new(LauncherState::new(
                 data_directory,
                 log_directory,
@@ -1600,6 +2422,18 @@ fn main() {
                 instance_lock,
             ));
             app.manage(state.clone());
+            #[cfg(target_os = "macos")]
+            if let Some(migration) = macos_bundle_migration.as_ref() {
+                if let Err(error) =
+                    sync_macos_autostart_path(app.handle(), &home_directory, migration)
+                {
+                    append_log(&state, &format!("autostart path sync failed: {error}"));
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(error) = install_taskctl_symlink(app.handle()) {
+                append_log(&state, &format!("taskctl sync failed: {error}"));
+            }
 
             let app_info = MenuItem::with_id(
                 app,
@@ -1626,7 +2460,7 @@ fn main() {
                 None::<&str>,
             )?;
             let check_update =
-                MenuItem::with_id(app, "check-update", "检查更新", false, None::<&str>)?;
+                MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
             let restart_codex =
                 MenuItem::with_id(app, "restart-codex", "重新打开 Codex", true, None::<&str>)?;
             let autostart_enabled = app.autolaunch().is_enabled()?;
@@ -1639,6 +2473,21 @@ fn main() {
                 None::<&str>,
             )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            #[cfg(target_os = "macos")]
+            let tray_menu = Menu::with_items(
+                app,
+                &[
+                    &app_info,
+                    &launcher_status,
+                    &open_taskboard_item,
+                    &open_taskboard_web,
+                    &restart_codex,
+                    &check_update,
+                    &autostart,
+                    &quit,
+                ],
+            )?;
+            #[cfg(not(target_os = "macos"))]
             let tray_menu = Menu::with_items(
                 app,
                 &[
@@ -1795,6 +2644,24 @@ fn main() {
             let startup_check_update = check_update.clone();
             let startup_quit = quit.clone();
             tauri::async_runtime::spawn(async move {
+                if let Some((legacy_skill, backup_path)) = legacy_skill_conflict {
+                    match resolve_legacy_skill_conflict(&app_handle, &legacy_skill, &backup_path) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            app_handle.exit(0);
+                            return;
+                        }
+                        Err(error) => {
+                            show_error_dialog(
+                                &app_handle,
+                                "Codex Taskboard Skill 更新失败",
+                                &format!("无法保留旧 Skill：{error}"),
+                            );
+                            app_handle.exit(1);
+                            return;
+                        }
+                    }
+                }
                 if let Err(error) = start_launcher(&app_handle, &state) {
                     append_log(&state, &format!("Launcher startup failed: {error}"));
                     update_snapshot(&app_handle, &state, |snapshot| {
@@ -1854,7 +2721,7 @@ fn main() {
         tauri::RunEvent::Exit => {
             if let Some(state) = app_handle.try_state::<Arc<LauncherState>>() {
                 stop_managed_child(app_handle, &state);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     libc::flock(state._instance_lock.as_raw_fd(), libc::LOCK_UN);
                 }

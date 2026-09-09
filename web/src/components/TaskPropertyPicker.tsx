@@ -1,3 +1,4 @@
+import { listenForOutsidePointerDown } from "../menuEvents";
 import {
   useEffect,
   useLayoutEffect,
@@ -23,6 +24,7 @@ interface TaskPropertyPickerProps<Value extends string> {
   open: boolean;
   disabled?: boolean;
   className?: string;
+  popoverClassName?: string;
   triggerClassName: string;
   triggerContent?: ReactNode;
   ariaLabel: string;
@@ -37,6 +39,7 @@ export function TaskPropertyPicker<Value extends string>({
   open,
   disabled = false,
   className = "",
+  popoverClassName = "",
   triggerClassName,
   triggerContent,
   ariaLabel,
@@ -87,6 +90,7 @@ export function TaskPropertyPicker<Value extends string>({
   }
 
   function closeFromFocusLeave(event: FocusEvent<HTMLElement>) {
+    if (menuRef.current?.matches(":active")) return;
     const next = event.relatedTarget as Node | null;
     if (!next || (!rootRef.current?.contains(next) && !menuRef.current?.contains(next))) {
       onOpenChange(false);
@@ -120,12 +124,7 @@ export function TaskPropertyPicker<Value extends string>({
   useEffect(() => {
     if (!open) return;
 
-    function closeFromOutside(event: PointerEvent) {
-      const target = event.target as Node;
-      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) {
-        onOpenChange(false);
-      }
-    }
+    const stopOutside = listenForOutsidePointerDown([rootRef, menuRef], () => onOpenChange(false));
 
     function closeFromEscape(event: globalThis.KeyboardEvent) {
       if (event.key !== "Escape") return;
@@ -135,17 +134,20 @@ export function TaskPropertyPicker<Value extends string>({
       triggerRef.current?.focus();
     }
 
-    function closeFromViewportChange() {
+    function closeFromViewportChange(event: Event) {
+      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
       onOpenChange(false);
     }
 
-    document.addEventListener("pointerdown", closeFromOutside);
     window.addEventListener("keydown", closeFromEscape);
-    window.addEventListener("resize", closeFromViewportChange);
-    window.addEventListener("scroll", closeFromViewportChange, true);
+    const viewportListenerFrame = requestAnimationFrame(() => {
+      window.addEventListener("resize", closeFromViewportChange);
+      window.addEventListener("scroll", closeFromViewportChange, true);
+    });
     return () => {
-      document.removeEventListener("pointerdown", closeFromOutside);
+      stopOutside();
       window.removeEventListener("keydown", closeFromEscape);
+      cancelAnimationFrame(viewportListenerFrame);
       window.removeEventListener("resize", closeFromViewportChange);
       window.removeEventListener("scroll", closeFromViewportChange, true);
     };
@@ -154,7 +156,7 @@ export function TaskPropertyPicker<Value extends string>({
   const menu = open ? createPortal(
     <div
       ref={menuRef}
-      className="composer-popover task-property-popover"
+      className={`composer-popover task-property-popover${popoverClassName ? ` ${popoverClassName}` : ""}`}
       role="listbox"
       aria-label={ariaLabel}
       style={{ position: "fixed", left: position.left, top: position.top }}
