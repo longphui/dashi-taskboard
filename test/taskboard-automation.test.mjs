@@ -145,6 +145,8 @@ test("the stable name and generated prompt are project-scoped and encode the cla
   assert.match(prompt, /每 5 分钟检查/);
   assert.match(prompt, /ppt-skill/);
   assert.match(prompt, /\/Users\/example\/Documents\/ppt-skill/);
+  assert.match(prompt, /第一条命令必须是下述 issue list/);
+  assert.match(prompt, /成功认领一个议题前，不得读取 automation memory/);
   assert.match(prompt, /每次仅处理一个符合依赖条件的 todo/);
   assert.match(prompt, /issue get/);
   assert.match(prompt, /comment list/);

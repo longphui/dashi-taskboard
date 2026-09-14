@@ -132,6 +132,7 @@ function buildLegacyTaskboardAutomationPrompt(request) {
   return [
     `[$manage-taskboard](${request.skillPath}) e-taskboard 每 ${request.intervalMinutes} 分钟检查任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
     `本轮所有 taskctl 操作都使用完整命令前缀 ${taskctlCommand}，不要使用 PATH 中的 taskctl。`,
+    "开始后第一条命令必须是下述 issue list。在成功认领一个议题前，不得读取 automation memory、仓库文件、项目文档或其他历史资料；技能已由任务入口加载时也不要重复读取。先完成待办筛选、议题及评论读取、依赖复核和认领，再读取执行所需资料。",
     `开始时先运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。若没有 todo，直接结束；Taskboard 主机侧会暂停当前自动化，不要创建或打开新的任务会话。`,
     ...executionInstructions,
     `本次处理或交接后，再次运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。若没有 todo，直接结束；Taskboard 主机侧会暂停当前自动化，避免后续创建空会话。`,
@@ -143,6 +144,7 @@ function buildLocalTaskboardAutomationPrompt(request) {
   return [
     `[$manage-taskboard](${request.skillPath}) e-taskboard 每 ${request.intervalMinutes} 分钟检查任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
     `本轮所有 taskctl 操作都使用完整命令前缀 ${taskctlCommand}，不要使用 PATH 中的 taskctl。`,
+    "开始后第一条命令必须是下述 issue list。在成功认领一个议题前，不得读取 automation memory、仓库文件、项目文档或其他历史资料；技能已由任务入口加载时也不要重复读取。先完成待办筛选、议题及评论读取、依赖复核和认领，再读取执行所需资料。",
     `开始时先运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。只选择没有 threadId 且依赖已完成的 todo；带 threadId 的 todo 由本机原会话续跑 worker 负责，当前自动化会话不得认领或处理。若不存在依赖已完成的未绑定 todo，立即结束本轮，不创建或打开新的任务会话。`,
     "从返回的 todo 中只选择依赖已完成的议题：relations.blockedBy 为空，或其中每个依赖的 status 都严格等于 done。无依赖的 todo 仍可并行处理。",
     "每次仅处理一个符合依赖条件的 todo：选定后先用 issue get 读取最新议题内容，并用 comment list 读取全部评论。根据描述和最新评论判断是否允许开始；若其中写明等待、暂不执行或当前不应开始，立即跳过并报告，不改状态。评论也包含已完成后被打回的返工要求。",
