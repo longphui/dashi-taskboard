@@ -172,6 +172,10 @@ test("the stable name and generated prompt are project-scoped and encode the cla
 
 test("the local automation prompt gives the exact atomic claim command", () => {
   const prompt = buildTaskboardAutomationPrompt({ ...baseRequest, taskboardMode: "local" });
+  assert.match(prompt, /必须选择 createdAt 最早的一个/);
+  assert.match(prompt, /createdAt 相同时按 identifier 升序选择/);
+  assert.match(prompt, /不得因标题、描述详略或列表位置让较新的议题插队/);
+  assert.match(prompt, /comment list <议题编号> --json/);
   assert.match(prompt, /issue move <议题编号> --status in_progress --if-version <刚读取的 version>/);
   assert.match(prompt, /--binding-thread-id "\$CODEX_THREAD_ID"/);
   assert.match(prompt, /--binding-codex-project-id "codex-project-123"/);
