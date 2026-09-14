@@ -626,6 +626,23 @@ function LocalRealtimeSync({
       }, 120);
     };
 
+    const refreshCurrentView = () => {
+      const { selectedProjectId, detailTaskId } = selectionRef.current;
+      void refreshProjectBoardDisplaySettings();
+      scheduleRefresh({ projects: true, tasks: Boolean(selectedProjectId) });
+      if (selectedProjectId && selectedProjectId !== ALL_PROJECTS_ID) {
+        setReadmeRevision((current) => current + 1);
+      }
+      if (detailTaskId) {
+        setCommentsRevision((current) => current + 1);
+        setAttachmentsRevision((current) => current + 1);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") refreshCurrentView();
+    };
+
     const handleEvent = (event: Event) => {
       const message = event as MessageEvent<string>;
       let payload: { projectId?: string; taskId?: string; project?: Project; key?: string } = {};
@@ -693,24 +710,19 @@ function LocalRealtimeSync({
     EVENT_NAMES.forEach((name) => source.addEventListener(name, handleEvent));
     source.onopen = () => {
       setConnection("live");
-      const { selectedProjectId, detailTaskId } = selectionRef.current;
-      void refreshProjectBoardDisplaySettings();
-      scheduleRefresh({ projects: true, tasks: Boolean(selectedProjectId) });
-      if (selectedProjectId && selectedProjectId !== ALL_PROJECTS_ID) {
-        setReadmeRevision((current) => current + 1);
-      }
-      if (detailTaskId) {
-        setCommentsRevision((current) => current + 1);
-        setAttachmentsRevision((current) => current + 1);
-      }
+      refreshCurrentView();
     };
     source.onerror = () => {
       setConnection("reconnecting");
     };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", refreshCurrentView);
 
     return () => {
       window.clearTimeout(refreshTimer);
       EVENT_NAMES.forEach((name) => source.removeEventListener(name, handleEvent));
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", refreshCurrentView);
       source.close();
     };
   }, [

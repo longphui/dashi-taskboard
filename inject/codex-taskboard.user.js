@@ -29,6 +29,7 @@
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
   const FRAME_REFRESH_PARAM = "__codex_taskboard_refresh";
   const PLUGIN_LABELS = ["插件", "plugins", "外掛程式", "プラグイン"];
+  const EXPLORE_LABELS = ["探索", "explore"];
   const NATIVE_PAGE_LABELS = [
     "新建任务",
     "新聊天",
@@ -285,6 +286,16 @@
     }).at(-1) || null;
   }
 
+  function findExploreButton() {
+    const scroll = document.querySelector("[data-app-action-sidebar-scroll]");
+    if (!scroll) return null;
+    return Array.from(scroll.querySelectorAll("button"))
+      .find((button) => (
+        button.getAttribute(OWNED_ATTRIBUTE) !== "true"
+        && buttonMatches(button, EXPLORE_LABELS)
+      )) || null;
+  }
+
   function replaceEntryIcon(button) {
     const icon = button.querySelector("svg");
     if (!icon) return;
@@ -346,7 +357,12 @@
     const reference = findReferenceButton();
     if (!reference?.parentElement) return;
     if (!entry) entry = createEntry(reference);
-    if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== reference) {
+    const explore = findExploreButton();
+    if (explore?.parentElement) {
+      if (entry.parentElement !== explore.parentElement || entry.nextElementSibling !== explore) {
+        explore.before(entry);
+      }
+    } else if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== reference) {
       reference.after(entry);
     }
     syncEntryState();

@@ -132,6 +132,7 @@ function buildLegacyTaskboardAutomationPrompt(request) {
   return [
     `[$manage-taskboard](${request.skillPath}) e-taskboard 每 ${request.intervalMinutes} 分钟检查任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
     `本轮所有 taskctl 操作都使用完整命令前缀 ${taskctlCommand}，不要使用 PATH 中的 taskctl。`,
+    "开始后第一条命令必须是下述 issue list。在成功认领一个议题前，不得读取 automation memory、仓库文件、项目文档或其他历史资料；技能已由任务入口加载时也不要重复读取。先完成待办筛选、议题及评论读取、依赖复核和认领，再读取执行所需资料。",
     `开始时先运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。若没有 todo，直接结束；Taskboard 主机侧会暂停当前自动化，不要创建或打开新的任务会话。`,
     ...executionInstructions,
     `本次处理或交接后，再次运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。若没有 todo，直接结束；Taskboard 主机侧会暂停当前自动化，避免后续创建空会话。`,
@@ -143,11 +144,12 @@ function buildLocalTaskboardAutomationPrompt(request) {
   return [
     `[$manage-taskboard](${request.skillPath}) e-taskboard 每 ${request.intervalMinutes} 分钟检查任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
     `本轮所有 taskctl 操作都使用完整命令前缀 ${taskctlCommand}，不要使用 PATH 中的 taskctl。`,
+    "开始后第一条命令必须是下述 issue list。在成功认领一个议题前，不得读取 automation memory、仓库文件、项目文档或其他历史资料；技能已由任务入口加载时也不要重复读取。先完成待办筛选、议题及评论读取、依赖复核和认领，再读取执行所需资料。",
     `开始时先运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。只选择没有 threadId 且依赖已完成的 todo；带 threadId 的 todo 由本机原会话续跑 worker 负责，当前自动化会话不得认领或处理。若不存在依赖已完成的未绑定 todo，立即结束本轮，不创建或打开新的任务会话。`,
-    "从返回的 todo 中只选择依赖已完成的议题：relations.blockedBy 为空，或其中每个依赖的 status 都严格等于 done。无依赖的 todo 仍可并行处理。",
-    "每次仅处理一个符合依赖条件的 todo：选定后先用 issue get 读取最新议题内容，并用 comment list 读取全部评论。根据描述和最新评论判断是否允许开始；若其中写明等待、暂不执行或当前不应开始，立即跳过并报告，不改状态。评论也包含已完成后被打回的返工要求。",
+    "从返回的 todo 中只选择依赖已完成的议题：relations.blockedBy 为空，或其中每个依赖的 status 都严格等于 done。无依赖的 todo 仍可并行处理。存在多个符合条件的 todo 时，必须选择 createdAt 最早的一个；createdAt 相同时按 identifier 升序选择。不得因标题、描述详略或列表位置让较新的议题插队。",
+    "每次仅处理一个符合依赖条件的 todo：选定后先用 issue get 读取最新议题内容，并用 comment list <议题编号> --json 读取全部评论。根据描述和最新评论判断是否允许开始；若其中写明等待、暂不执行或当前不应开始，立即跳过并报告，不改状态。评论也包含已完成后被打回的返工要求。",
     "完成 issue get 和 comment list 后、移动状态前，必须再次运行 issue get，并复核 relations.blockedBy 仍为空或其中每个依赖的 status 都严格等于 done。若依赖条件不再满足，立即跳过并结束本轮，不改状态。",
-    "确认允许开始后，必须在读取代码、下载附件、分析或实施前，使用刚读取的 version 将仍可认领的未绑定 todo 移到 in_progress；写入成功前不得继续。不得认领已被其他会话绑定或其他 Agent 领取的议题。",
+    `确认允许开始后，必须在读取代码、下载附件、分析或实施前，只使用 ${taskctlCommand} issue move <议题编号> --status in_progress --if-version <刚读取的 version> --binding-thread-id "$CODEX_THREAD_ID" --binding-codex-project-id ${JSON.stringify(request.codexProjectId)} --binding-codex-project-kind "local" --binding-codex-host-id ${JSON.stringify(request.codexHostId)} --binding-workspace-path ${JSON.stringify(request.workspacePath)} --json 将仍可认领的未绑定 todo 移到 in_progress；不得使用 issue update 修改状态，也不得猜测参数。写入成功前不得继续。不得认领已被其他会话绑定或其他 Agent 领取的议题。`,
     "若因 version 陈旧发生版本冲突，重新运行 issue get 和 comment list；仅当仍为可认领未绑定 todo、未归档且描述和最新评论未变化时，用最新 version 重试一次。若已被认领、状态或要求已变、已归档、服务或永久 API 错误，或重试仍失败，立即跳过该议题、退出并报告；不得抢占或循环重试。",
     "若议题已绑定 branch 或 worktree，必须在该议题绑定的开发上下文执行，避免并行 Agent 修改同一工作目录。",
     "执行完成并验证后，先用 comment add 记录关键改动、验证结果、执行结果和剩余风险，再使用最新 version 将议题移动到 in_review；不要直接标记为 done。",

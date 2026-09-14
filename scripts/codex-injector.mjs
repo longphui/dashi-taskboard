@@ -2027,9 +2027,9 @@ async function failTaskResumeRequest(claim, error, permanent = false) {
   });
 }
 
-async function readTaskResumeThread(cdp, request) {
+async function readTaskResumeThread(cdp, codexHostId, request) {
   const read = async () => {
-    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/read", {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/read", {
       threadId: request.threadId,
       includeTurns: false,
     });
@@ -2040,7 +2040,7 @@ async function readTaskResumeThread(cdp, request) {
     return await read();
   } catch {
     try {
-      await requestCodexAppServerViaCdp(cdp, undefined, "thread/unarchive", {
+      await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/unarchive", {
         threadId: request.threadId,
       });
     } catch {}
@@ -2049,7 +2049,7 @@ async function readTaskResumeThread(cdp, request) {
     } catch (error) {
       if (isTaskResumeTransientError(error)) throw error;
       try {
-        await requestCodexAppServerViaCdp(cdp, undefined, "thread/resume", {
+        await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/resume", {
           threadId: request.threadId,
           excludeTurns: true,
         });
@@ -2062,7 +2062,7 @@ async function readTaskResumeThread(cdp, request) {
   }
 }
 
-async function deliverTaskResumeRequest(cdp, claim) {
+async function deliverTaskResumeRequest(cdp, codexHostId, claim) {
   const { request } = claim;
   const task = await readTaskResumeTask(request);
   if (!taskResumeRequestMatchesTask(task, request)) {
@@ -2074,17 +2074,17 @@ async function deliverTaskResumeRequest(cdp, claim) {
     return;
   }
 
-  let thread = await readTaskResumeThread(cdp, request);
+  let thread = await readTaskResumeThread(cdp, codexHostId, request);
   if (thread.status?.type === "active") {
     await deferTaskResumeRequest(claim, "Original thread is active");
     return;
   }
   if (thread.status?.type === "notLoaded" || thread.canAcceptDirectInput !== true) {
-    await requestCodexAppServerViaCdp(cdp, undefined, "thread/resume", {
+    await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/resume", {
       threadId: request.threadId,
       excludeTurns: true,
     });
-    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/read", {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/read", {
       threadId: request.threadId,
       includeTurns: false,
     });
@@ -2105,7 +2105,7 @@ async function deliverTaskResumeRequest(cdp, claim) {
   }
 
   const sandboxPolicy = await readTaskResumeSandboxPolicy(thread);
-  const result = await requestCodexAppServerViaCdp(cdp, undefined, "turn/start", {
+  const result = await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "turn/start", {
     threadId: request.threadId,
     clientUserMessageId: request.id,
     input: [{ type: "text", text: buildTaskResumePrompt(task, request), text_elements: [] }],
@@ -2123,7 +2123,7 @@ async function deliverTaskResumeRequest(cdp, claim) {
   }
 }
 
-async function observeTaskResumeTurn(cdp, claim) {
+async function observeTaskResumeTurn(cdp, codexHostId, claim) {
   const { request } = claim;
   const turnListDeadline = Date.now() + taskResumeTurnListDeadlineMs;
   let task = await readTaskResumeTask(request);
@@ -2142,7 +2142,7 @@ async function observeTaskResumeTurn(cdp, claim) {
       turnListTimedOut = true;
       break;
     }
-    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/turns/list", {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/turns/list", {
       threadId: request.threadId,
       limit: taskResumeTurnListLimit,
       sortDirection: "desc",
@@ -2234,12 +2234,13 @@ async function cleanupUnusedTaskboardAutomationThreads(cdp) {
     )),
     ...(openResumeThreads.threadIds ?? []),
   ].filter((threadId) => typeof threadId === "string" && threadId.length > 0));
-  const automationNames = new Set(
-    [...quotaPolicyRecords.values()].map((record) => buildTaskboardAutomationName(record.request)),
-  );
+  const automationPolicies = [...quotaPolicyRecords.values()].map((record) => ({
+    automationName: buildTaskboardAutomationName(record.request),
+    codexHostId: record.request.codexHostId,
+  }));
 
-  for (const automationName of automationNames) {
-    const result = await requestCodexAppServerViaCdp(cdp, undefined, "thread/list", {
+  for (const { automationName, codexHostId } of automationPolicies) {
+    const result = await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/list", {
       archived: false,
       searchTerm: automationName,
       limit: 100,
@@ -2256,7 +2257,7 @@ async function cleanupUnusedTaskboardAutomationThreads(cdp) {
         || !threadIsAtLeastThirtySecondsOld(thread)
         || protectedThreadIds.has(thread.id)
       ) continue;
-      await requestCodexAppServerViaCdp(cdp, undefined, "thread/archive", {
+      await requestCodexAppServerViaCdp(cdp, undefined, codexHostId, "thread/archive", {
         threadId: thread.id,
       });
     }
@@ -2311,8 +2312,10 @@ async function runTaskResumeWorkerPass(cdp) {
       nextDelayMs = 10_000;
       return;
     }
-    if (claim.operation === "observe") await observeTaskResumeTurn(cdp, claim);
-    else await deliverTaskResumeRequest(cdp, claim);
+    const codexHostId = quotaPolicyRecords.get(claim.request.projectId)?.request.codexHostId;
+    if (!codexHostId) throw taskResumePermanentError("Original thread host is unavailable");
+    if (claim.operation === "observe") await observeTaskResumeTurn(cdp, codexHostId, claim);
+    else await deliverTaskResumeRequest(cdp, codexHostId, claim);
   } catch (error) {
     if (claim?.request) {
       try {

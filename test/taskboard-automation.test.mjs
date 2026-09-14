@@ -145,6 +145,8 @@ test("the stable name and generated prompt are project-scoped and encode the cla
   assert.match(prompt, /每 5 分钟检查/);
   assert.match(prompt, /ppt-skill/);
   assert.match(prompt, /\/Users\/example\/Documents\/ppt-skill/);
+  assert.match(prompt, /第一条命令必须是下述 issue list/);
+  assert.match(prompt, /成功认领一个议题前，不得读取 automation memory/);
   assert.match(prompt, /每次仅处理一个符合依赖条件的 todo/);
   assert.match(prompt, /issue get/);
   assert.match(prompt, /comment list/);
@@ -166,6 +168,21 @@ test("the stable name and generated prompt are project-scoped and encode the cla
   assert.match(prompt, /不要省略 binding，避免把完整绑定降级为 legacy local/);
   assert.doesNotMatch(prompt, /automation_update/);
   assert.match(prompt, /Taskboard 主机侧会暂停当前自动化/);
+});
+
+test("the local automation prompt gives the exact atomic claim command", () => {
+  const prompt = buildTaskboardAutomationPrompt({ ...baseRequest, taskboardMode: "local" });
+  assert.match(prompt, /必须选择 createdAt 最早的一个/);
+  assert.match(prompt, /createdAt 相同时按 identifier 升序选择/);
+  assert.match(prompt, /不得因标题、描述详略或列表位置让较新的议题插队/);
+  assert.match(prompt, /comment list <议题编号> --json/);
+  assert.match(prompt, /issue move <议题编号> --status in_progress --if-version <刚读取的 version>/);
+  assert.match(prompt, /--binding-thread-id "\$CODEX_THREAD_ID"/);
+  assert.match(prompt, /--binding-codex-project-id "codex-project-123"/);
+  assert.match(prompt, /--binding-codex-project-kind "local"/);
+  assert.match(prompt, /--binding-codex-host-id "local"/);
+  assert.match(prompt, /--binding-workspace-path "\/Users\/example\/Documents\/ppt-skill"/);
+  assert.match(prompt, /不得使用 issue update 修改状态/);
 });
 
 test("the remote automation prompt keeps taskctl local and delegates work to the SSH project", () => {
