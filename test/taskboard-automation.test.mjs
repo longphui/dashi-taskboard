@@ -170,6 +170,17 @@ test("the stable name and generated prompt are project-scoped and encode the cla
   assert.match(prompt, /Taskboard 主机侧会暂停当前自动化/);
 });
 
+test("the local automation prompt gives the exact atomic claim command", () => {
+  const prompt = buildTaskboardAutomationPrompt({ ...baseRequest, taskboardMode: "local" });
+  assert.match(prompt, /issue move <议题编号> --status in_progress --if-version <刚读取的 version>/);
+  assert.match(prompt, /--binding-thread-id "\$CODEX_THREAD_ID"/);
+  assert.match(prompt, /--binding-codex-project-id "codex-project-123"/);
+  assert.match(prompt, /--binding-codex-project-kind "local"/);
+  assert.match(prompt, /--binding-codex-host-id "local"/);
+  assert.match(prompt, /--binding-workspace-path "\/Users\/example\/Documents\/ppt-skill"/);
+  assert.match(prompt, /不得使用 issue update 修改状态/);
+});
+
 test("the remote automation prompt keeps taskctl local and delegates work to the SSH project", () => {
   const prompt = buildTaskboardAutomationPrompt(remoteRequest);
   assert.match(prompt, /仅在本机作为任务面板控制器运行/);

@@ -149,7 +149,7 @@ function buildLocalTaskboardAutomationPrompt(request) {
     "从返回的 todo 中只选择依赖已完成的议题：relations.blockedBy 为空，或其中每个依赖的 status 都严格等于 done。无依赖的 todo 仍可并行处理。",
     "每次仅处理一个符合依赖条件的 todo：选定后先用 issue get 读取最新议题内容，并用 comment list 读取全部评论。根据描述和最新评论判断是否允许开始；若其中写明等待、暂不执行或当前不应开始，立即跳过并报告，不改状态。评论也包含已完成后被打回的返工要求。",
     "完成 issue get 和 comment list 后、移动状态前，必须再次运行 issue get，并复核 relations.blockedBy 仍为空或其中每个依赖的 status 都严格等于 done。若依赖条件不再满足，立即跳过并结束本轮，不改状态。",
-    "确认允许开始后，必须在读取代码、下载附件、分析或实施前，使用刚读取的 version 将仍可认领的未绑定 todo 移到 in_progress；写入成功前不得继续。不得认领已被其他会话绑定或其他 Agent 领取的议题。",
+    `确认允许开始后，必须在读取代码、下载附件、分析或实施前，只使用 ${taskctlCommand} issue move <议题编号> --status in_progress --if-version <刚读取的 version> --binding-thread-id "$CODEX_THREAD_ID" --binding-codex-project-id ${JSON.stringify(request.codexProjectId)} --binding-codex-project-kind "local" --binding-codex-host-id ${JSON.stringify(request.codexHostId)} --binding-workspace-path ${JSON.stringify(request.workspacePath)} --json 将仍可认领的未绑定 todo 移到 in_progress；不得使用 issue update 修改状态，也不得猜测参数。写入成功前不得继续。不得认领已被其他会话绑定或其他 Agent 领取的议题。`,
     "若因 version 陈旧发生版本冲突，重新运行 issue get 和 comment list；仅当仍为可认领未绑定 todo、未归档且描述和最新评论未变化时，用最新 version 重试一次。若已被认领、状态或要求已变、已归档、服务或永久 API 错误，或重试仍失败，立即跳过该议题、退出并报告；不得抢占或循环重试。",
     "若议题已绑定 branch 或 worktree，必须在该议题绑定的开发上下文执行，避免并行 Agent 修改同一工作目录。",
     "执行完成并验证后，先用 comment add 记录关键改动、验证结果、执行结果和剩余风险，再使用最新 version 将议题移动到 in_review；不要直接标记为 done。",
